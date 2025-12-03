@@ -1,0 +1,21 @@
+[package]
+name = "sanctuary-vault-lite"
+version = "0.1.0"
+edition = "2021"
+description = "Real-time sovereign file encryption watcher – Sanctuary Vault Lite"
+license = "AGPL-3.0"
+
+[dependencies]
+notify = { version = "6.1", features = ["serde"] }
+pqcnet = { path = "../pqcnet" }  # Your existing PQCNet crate
+blake3 = "1.5"
+serde = { version = "1.0", features = ["derive"] }
+bincode = "2.0"
+zeroize = "1.7"
+chrono = "0.4"
+winreg = { version = "0.52", optional = true }
+notify-debouncer-full = "0.3"
+
+[features]
+default = ["windows-overlay"]
+windows-overlay = ["winreg"]
