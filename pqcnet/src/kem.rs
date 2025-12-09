@@ -39,3 +39,38 @@ impl MlKem1024 {
         Ok((ciphertext, shared_secret))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keypair_is_deterministic_for_instance() {
+        let kem = MlKem1024::new().expect("kem");
+
+        let (pk1, sk1) = kem.keypair().expect("first keypair");
+        let (pk2, sk2) = kem.keypair().expect("second keypair");
+
+        assert_eq!(pk1, pk2);
+        assert_eq!(sk1, sk2);
+        assert_eq!(pk1.len(), 32);
+        assert_eq!(sk1.len(), 32);
+    }
+
+    #[test]
+    fn encapsulate_changes_ciphertext_and_secret() {
+        let kem = MlKem1024::new().expect("kem");
+        let (pk, _) = kem.keypair().expect("keypair");
+
+        let (ct1, ss1) = kem.encapsulate(&pk).expect("first encapsulate");
+        let (ct2, ss2) = kem.encapsulate(&pk).expect("second encapsulate");
+
+        assert_eq!(ct1.len(), 96);
+        assert_eq!(ss1.len(), 32);
+        assert_eq!(ct2.len(), 96);
+        assert_eq!(ss2.len(), 32);
+
+        assert_ne!(ct1, ct2, "ciphertexts must include fresh salt");
+        assert_ne!(ss1, ss2, "shared secrets must derive from salt");
+    }
+}

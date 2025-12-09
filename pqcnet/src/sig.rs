@@ -25,3 +25,30 @@ impl Dilithium5 {
         Ok(signer.finalize().as_bytes().to_vec())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keypair_returns_expected_lengths() {
+        let sig = Dilithium5::new().expect("sig");
+        let (pk, sk) = sig.keypair().expect("keypair");
+
+        assert_eq!(pk.len(), 32);
+        assert_eq!(sk.len(), 32);
+    }
+
+    #[test]
+    fn sign_is_deterministic_per_message() {
+        let sig = Dilithium5::new().expect("sig");
+        let message = b"quantum immune";
+
+        let first = sig.sign(message).expect("first signature");
+        let second = sig.sign(message).expect("second signature");
+        let different = sig.sign(b"different payload").expect("different signature");
+
+        assert_eq!(first, second);
+        assert_ne!(first, different);
+    }
+}

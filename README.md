@@ -22,6 +22,23 @@ Your vault is ready.
 2. The first log line after the usage banner confirms where the Autheo PQC runtime `.wasm` payload was loaded from.
 3. Drop any file into the vault path—Theo Vault watches recursively and rewrites everything to `.pqc`.
 
+### Git Bash on Windows (exact invocation)
+- Open Git Bash in the repo root (e.g., `~/Videos/AutheoPrivacyNet/vaults/theo-vault`).
+- Use forward slashes and the `/c/` prefix that Git Bash expects when targeting a Windows drive.
+- Quote the vault path so Cargo receives it as a single argument:
+
+```bash
+cargo run -- init "/c/Users/aeria/Videos/AutheoPrivacyNet/vaults/theo-vault"
+```
+
+Cargo will build `sanctuary-vault-lite.exe`, execute it with the Windows-style path, and you will see:
+
+```
+Autheo PQC runtime loaded from C:\Users\aeria\Videos\AutheoPrivacyNet\vaults\theo-vault\wasm\autheo_pqc_wasm.wasm
+Theo Vault active on: C:\Users\aeria\Videos\AutheoPrivacyNet\vaults\theo-vault
+All files are now quantum-immune. Breach = worthless.
+```
+
 ### Autheo WASM runtime
 - The repository already ships `wasm/autheo_pqc_wasm.wasm`. Keep that folder next to the binary or point to the file explicitly.
 - The binary searches for the payload relative to the current working directory, the compiled executable, and `CARGO_MANIFEST_DIR`. If it still cannot find it, set an explicit path:

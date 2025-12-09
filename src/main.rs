@@ -271,3 +271,54 @@ fn apply_overlay_to_folder(_path: &PathBuf) -> Result<(), DynError> {
 fn apply_encrypted_overlay(_path: &PathBuf) -> Result<(), DynError> {
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn tuplechain_truncates_to_max_entries() {
+        let mut chain = TupleChain::new();
+        let now = chrono::Utc::now();
+
+        for idx in 0..2050 {
+            let original = PathBuf::from(format!("original_{idx}.txt"));
+            let encrypted = PathBuf::from(format!("original_{idx}.pqc"));
+            chain.mint_encrypted_file(&original, &encrypted, now);
+        }
+
+        assert_eq!(chain.entries.len(), 2048);
+        assert_eq!(
+            chain.entries.first().unwrap().original,
+            PathBuf::from("original_2.txt")
+        );
+        assert_eq!(
+            chain.entries.last().unwrap().original,
+            PathBuf::from("original_2049.txt")
+        );
+    }
+
+    #[test]
+    fn encrypt_file_creates_pqc_bundle_and_tuple_entry() -> Result<(), DynError> {
+        let temp = tempdir().expect("temp dir");
+        let vault_dir = temp.path().join("vault");
+        let vault = Vault::init(vault_dir.clone())?;
+
+        let plaintext = vault_dir.join("note.txt");
+        fs::write(&plaintext, b"hello sovereign world")?;
+
+        vault.encrypt_file(&plaintext)?;
+
+        let encrypted = plaintext.with_extension("pqc");
+        assert!(encrypted.exists(), "encrypted bundle should exist");
+
+        let chain = vault.tuplechain.lock().unwrap();
+        let last = chain.entries.last().expect("tuplechain entry recorded");
+        assert_eq!(last.original, plaintext);
+        assert_eq!(last.encrypted, encrypted);
+
+        Ok(())
+    }
+}

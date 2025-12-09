@@ -55,4 +55,15 @@ mod tests {
 
         assert_ne!(first, second);
     }
+
+    #[test]
+    fn ciphertext_includes_nonce_and_tag() {
+        let key = [0u8; 32];
+        let plaintext = vec![0u8; 64];
+
+        let ciphertext = encrypt_aes_gcm_siv(&key, &plaintext).expect("ciphertext");
+
+        // 12-byte nonce + 64-byte body + 16-byte tag
+        assert_eq!(ciphertext.len(), 12 + plaintext.len() + 16);
+    }
 }
