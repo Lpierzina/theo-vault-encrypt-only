@@ -110,7 +110,7 @@ fn main() -> Result<(), DynError> {
 impl Vault {
     fn init(path: PathBuf) -> Result<Self, DynError> {
         fs::create_dir_all(&path)?;
-        
+
         let kem = MlKem1024::new()?;
         let sig = Dilithium5::new()?;
         let (_, kem_sk) = kem.keypair()?;
@@ -122,7 +122,11 @@ impl Vault {
         #[cfg(all(windows, feature = "windows-overlay"))]
         apply_overlay_to_folder(&path)?;
 
-        Ok(Vault { path, keypair, tuplechain })
+        Ok(Vault {
+            path,
+            keypair,
+            tuplechain,
+        })
     }
 
     fn encrypt_file(&self, path: &PathBuf) -> Result<(), DynError> {
@@ -135,7 +139,10 @@ impl Vault {
         let signature = Dilithium5::new()?.sign(&encrypted)?;
 
         let bundle = bincode::serialize(&(
-            ct, encrypted, signature, path.file_name().unwrap().to_string_lossy()
+            ct,
+            encrypted,
+            signature,
+            path.file_name().unwrap().to_string_lossy(),
         ))?;
 
         let encrypted_path = path.with_extension("pqc");
@@ -146,7 +153,9 @@ impl Vault {
 
         // Mint TupleChain entry
         self.tuplechain.lock().unwrap().mint_encrypted_file(
-            path, &encrypted_path, chrono::Utc::now()
+            path,
+            &encrypted_path,
+            chrono::Utc::now(),
         );
 
         // Zeroize plaintext from RAM
@@ -221,12 +230,15 @@ fn register_shell_overlay() -> Result<(), DynError> {
     use winreg::enums::*;
     use winreg::RegKey;
 
-    let hkcr = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(
-        "Software\\Classes\\*\\shell\\pqc-vault",
-        KEY_WRITE,
-    )?;
-    hkcr.set_value("", &"Open with Theo Vault")?;
-    hkcr.set_value("Icon", &r"C:\Program Files\Theo\icon.ico")?;
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let (vault_key, _) =
+        hkcu.create_subkey_with_flags("Software\\Classes\\*\\shell\\pqc-vault", KEY_WRITE)?;
+
+    vault_key.set_value("", &"Open with Theo Vault")?;
+    vault_key.set_value("Icon", &r"C:\Program Files\Theo\icon.ico")?;
+
+    let (command_key, _) = vault_key.create_subkey_with_flags("command", KEY_WRITE)?;
+    command_key.set_value("", &r#""C:\Program Files\Theo\theo-vault.exe" "%1""#)?;
     Ok(())
 }
 
@@ -259,4 +271,3 @@ fn apply_overlay_to_folder(_path: &PathBuf) -> Result<(), DynError> {
 fn apply_encrypted_overlay(_path: &PathBuf) -> Result<(), DynError> {
     Ok(())
 }
-
