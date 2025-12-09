@@ -233,6 +233,8 @@ impl Vault {
             Err(err) => return Err(err.into()),
         }
 
+        self.purge_plaintext(path)?;
+
         #[cfg(all(windows, feature = "windows-overlay"))]
         apply_encrypted_overlay(&encrypted_path)?;
 
@@ -287,6 +289,14 @@ impl Vault {
                 }
                 Err(err) => Err(err),
             },
+        }
+    }
+
+    fn purge_plaintext(&self, path: &PathBuf) -> Result<(), DynError> {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err.into()),
         }
     }
 }
@@ -448,6 +458,10 @@ mod tests {
 
         let encrypted = plaintext.with_extension("pqc");
         assert!(encrypted.exists(), "encrypted bundle should exist");
+        assert!(
+            !plaintext.exists(),
+            "plaintext should be removed after encryption"
+        );
 
         let chain = vault.tuplechain.lock().unwrap();
         let last = chain.entries.last().expect("tuplechain entry recorded");
