@@ -56,8 +56,7 @@ impl TupleChain {
         const MAX_RETENTION_HOURS: i64 = 24;
 
         let cutoff = timestamp - chrono::Duration::hours(MAX_RETENTION_HOURS);
-        self.entries
-            .retain(|entry| entry.timestamp >= cutoff);
+        self.entries.retain(|entry| entry.timestamp >= cutoff);
 
         if self.entries.len() > MAX_ENTRIES {
             self.entries.drain(0..(self.entries.len() - MAX_ENTRIES));
@@ -121,7 +120,11 @@ fn main() -> Result<(), DynError> {
         ) {
             for path in event.paths {
                 if let Err(err) = vault.encrypt_plain_file_if_needed(&path) {
-                    eprintln!("encrypt error for {}: {err}", path.display());
+                    eprintln!(
+                        "vault integrity violation detected at {}: {err}",
+                        path.display()
+                    );
+                    std::process::exit(1);
                 }
             }
         }
@@ -188,7 +191,11 @@ impl Vault {
         };
 
         if !metadata.is_file() {
-            return Ok(());
+            return Err(format!(
+                "unauthorized non-file entry detected ({}). Vaults are immutable; no folders or special files allowed.",
+                path.display()
+            )
+            .into());
         }
 
         if path.extension().map_or(false, |e| e == "pqc") {
@@ -358,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn directory_events_are_ignored() -> Result<(), DynError> {
+    fn directory_events_trigger_errors() -> Result<(), DynError> {
         let temp = tempdir().expect("temp dir");
         let vault_dir = temp.path().join("vault");
         let vault = Vault::init(vault_dir.clone())?;
@@ -366,17 +373,12 @@ mod tests {
         let nested_dir = vault_dir.join("nested");
         fs::create_dir(&nested_dir)?;
 
-        vault.encrypt_plain_file_if_needed(&nested_dir)?;
-
+        let err = vault
+            .encrypt_plain_file_if_needed(&nested_dir)
+            .expect_err("directories must be treated as integrity violations");
         assert!(
-            !nested_dir.with_extension("pqc").exists(),
-            "directories should not produce encrypted bundles"
-        );
-
-        let chain = vault.tuplechain.lock().unwrap();
-        assert!(
-            chain.entries.is_empty(),
-            "directory events should not mint tuple entries"
+            err.to_string().contains("non-file entry") || err.to_string().contains("immutable"),
+            "error message should call out unauthorized directory handling"
         );
 
         Ok(())
