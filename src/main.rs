@@ -1,8 +1,9 @@
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use pqcnet::kem::MlKem1024;
 use pqcnet::sig::Dilithium5;
-use std::path::PathBuf;
+use std::env;
 use std::fs;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
@@ -19,11 +20,14 @@ struct KeyPair {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
         println!("Usage: theo-vault init <path>");
         return Ok(());
     }
+
+    let wasm_path = configure_wasm_runtime()?;
+    println!("Autheo PQC runtime loaded from {}", wasm_path.display());
 
     let vault_path = PathBuf::from(&args[2]);
     let vault = Vault::init(vault_path)?;
@@ -98,6 +102,67 @@ impl Vault {
         drop(data);
         Ok(())
     }
+}
+
+fn configure_wasm_runtime() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    const USER_ENV_KEY: &str = "THEO_VAULT_WASM_PATH";
+    const PQCNET_ENV_KEY: &str = "PQCNET_WASM_PATH";
+    const WASM_FILE: &str = "autheo_pqc_wasm.wasm";
+
+    for key in [USER_ENV_KEY, PQCNET_ENV_KEY] {
+        if let Some(value) = env::var_os(key) {
+            let path = PathBuf::from(&value);
+            if path.is_file() {
+                env::set_var(USER_ENV_KEY, &path);
+                env::set_var(PQCNET_ENV_KEY, &path);
+                return Ok(path);
+            } else {
+                return Err(format!(
+                    "{} points to '{}' but the file does not exist",
+                    key,
+                    path.display()
+                )
+                .into());
+            }
+        }
+    }
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    if let Ok(current_dir) = env::current_dir() {
+        candidates.push(current_dir.join("wasm").join(WASM_FILE));
+        candidates.push(current_dir.join(WASM_FILE));
+    }
+
+    if let Some(manifest_dir) = option_env!("CARGO_MANIFEST_DIR") {
+        candidates.push(PathBuf::from(manifest_dir).join("wasm").join(WASM_FILE));
+    }
+
+    if let Ok(exe_path) = env::current_exe() {
+        if let Some(parent) = exe_path.parent() {
+            let parent = parent.to_path_buf();
+            candidates.push(parent.join("wasm").join(WASM_FILE));
+            candidates.push(parent.join(WASM_FILE));
+        }
+    }
+
+    candidates.push(PathBuf::from("wasm").join(WASM_FILE));
+    candidates.push(PathBuf::from(WASM_FILE));
+
+    for candidate in candidates {
+        if candidate.is_file() {
+            env::set_var(USER_ENV_KEY, &candidate);
+            env::set_var(PQCNET_ENV_KEY, &candidate);
+            return Ok(candidate);
+        }
+    }
+
+    Err(format!(
+        "Autheo PQC runtime not found. Place '{}' inside a ./wasm directory \
+or point {} to the file before running theo-vault.",
+        WASM_FILE, USER_ENV_KEY
+    )
+    .into())
 }
 
 #[cfg(feature = "windows-overlay")]

@@ -17,6 +17,24 @@ It is the end of the era of data breaches, ransomware, and surveillance capitali
 Welcome to the sovereign internet.
 Your vault is ready.
 
+## Run It Locally
+1. Compile or run directly with Cargo: `cargo run -- init /path/to/vault`.
+2. The first log line after the usage banner confirms where the Autheo PQC runtime `.wasm` payload was loaded from.
+3. Drop any file into the vault path—Theo Vault watches recursively and rewrites everything to `.pqc`.
+
+### Autheo WASM runtime
+- The repository already ships `wasm/autheo_pqc_wasm.wasm`. Keep that folder next to the binary or point to the file explicitly.
+- The binary searches for the payload relative to the current working directory, the compiled executable, and `CARGO_MANIFEST_DIR`. If it still cannot find it, set an explicit path:
+
+```bash
+THEO_VAULT_WASM_PATH=/absolute/path/autheo_pqc_wasm.wasm \
+./target/release/theo-vault init ~/THEO
+```
+
+- The CLI mirrors `THEO_VAULT_WASM_PATH` into `PQCNET_WASM_PATH`, so the downstream `pqcnet` crate always receives the same location.
+- When the runtime boots you will see `Autheo PQC runtime loaded from <path>`—if you do not see that line, the WASM was not found and PQCNet will refuse to operate.
+- For production deployments bundle `autheo_pqc_wasm.wasm` next to the binary (e.g., `theo-vault.exe` and a sibling `wasm/` directory) so the watcher works without additional flags.
+
 # About THEO Vault
 ✅ Real-time file encryption (CKKS)
 ✅ Windows green lock overlay (real shell extension)
