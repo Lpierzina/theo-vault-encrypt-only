@@ -211,6 +211,8 @@ impl Vault {
                 }
             }
         };
+        let plaintext_len = data.len();
+
         let (ct, ss) = self.keypair.encapsulate()?;
 
         let encrypted = pqcnet::encrypt_aes_gcm_siv(&ss, &data)?;
@@ -234,6 +236,13 @@ impl Vault {
         }
 
         self.purge_plaintext(path)?;
+
+        println!(
+            "[theo-vault] sealed {} → {} ({} bytes)",
+            path.display(),
+            encrypted_path.display(),
+            plaintext_len
+        );
 
         #[cfg(all(windows, feature = "windows-overlay"))]
         apply_encrypted_overlay(&encrypted_path)?;
