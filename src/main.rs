@@ -6,6 +6,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+type DynError = Box<dyn std::error::Error + Send + Sync>;
+
 #[derive(Clone)]
 struct Vault {
     path: PathBuf,
@@ -19,7 +21,45 @@ struct KeyPair {
     sig_sk: Vec<u8>,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[derive(Clone, Default)]
+struct TupleChain {
+    entries: Vec<TupleEntry>,
+}
+
+#[derive(Clone)]
+struct TupleEntry {
+    original: PathBuf,
+    encrypted: PathBuf,
+    timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+impl TupleChain {
+    fn new() -> Self {
+        Self {
+            entries: Vec::with_capacity(64),
+        }
+    }
+
+    fn mint_encrypted_file(
+        &mut self,
+        original: &PathBuf,
+        encrypted: &PathBuf,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) {
+        self.entries.push(TupleEntry {
+            original: original.clone(),
+            encrypted: encrypted.clone(),
+            timestamp,
+        });
+
+        const MAX_ENTRIES: usize = 2048;
+        if self.entries.len() > MAX_ENTRIES {
+            self.entries.drain(0..(self.entries.len() - MAX_ENTRIES));
+        }
+    }
+}
+
+fn main() -> Result<(), DynError> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
         println!("Usage: theo-vault init <path>");
@@ -35,18 +75,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Theo Vault active on: {}", vault.path.display());
     println!("All files are now quantum-immune. Breach = worthless.");
 
-    #[cfg(feature = "windows-overlay")]
+    #[cfg(all(windows, feature = "windows-overlay"))]
     register_shell_overlay()?;
 
     let (tx, rx) = std::sync::mpsc::channel();
     let mut watcher = RecommendedWatcher::new(tx, Config::default())?;
     watcher.watch(&vault.path, RecursiveMode::Recursive)?;
 
-    for event in rx {
-        if let notify::EventKind::Create(_) | notify::EventKind::Modify(_) = event.kind {
+    for result in rx {
+        let event = match result {
+            Ok(event) => event,
+            Err(err) => {
+                eprintln!("watch error: {err}");
+                continue;
+            }
+        };
+
+        if matches!(
+            event.kind,
+            notify::EventKind::Create(_) | notify::EventKind::Modify(_)
+        ) {
             for path in event.paths {
                 if path.extension().map_or(true, |e| e != "pqc") {
-                    let _ = vault.encrypt_file(&path);
+                    if let Err(err) = vault.encrypt_file(&path) {
+                        eprintln!("encrypt error for {}: {err}", path.display());
+                    }
                 }
             }
         }
@@ -55,7 +108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 impl Vault {
-    fn init(path: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+    fn init(path: PathBuf) -> Result<Self, DynError> {
         fs::create_dir_all(&path)?;
         
         let kem = MlKem1024::new()?;
@@ -66,14 +119,13 @@ impl Vault {
         let keypair = KeyPair { kem_sk, sig_sk };
         let tuplechain = Arc::new(Mutex::new(TupleChain::new()));
 
-        // Register vault in Windows shell (green lock overlay)
-        #[cfg(feature = "windows-overlay")]
+        #[cfg(all(windows, feature = "windows-overlay"))]
         apply_overlay_to_folder(&path)?;
 
         Ok(Vault { path, keypair, tuplechain })
     }
 
-    fn encrypt_file(&self, path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    fn encrypt_file(&self, path: &PathBuf) -> Result<(), DynError> {
         let data = fs::read(path)?;
         let kem = MlKem1024::new()?;
         let (pk, _) = kem.keypair()?;
@@ -89,8 +141,7 @@ impl Vault {
         let encrypted_path = path.with_extension("pqc");
         fs::write(&encrypted_path, bundle)?;
 
-        // Apply green lock overlay
-        #[cfg(feature = "windows-overlay")]
+        #[cfg(all(windows, feature = "windows-overlay"))]
         apply_encrypted_overlay(&encrypted_path)?;
 
         // Mint TupleChain entry
@@ -104,7 +155,7 @@ impl Vault {
     }
 }
 
-fn configure_wasm_runtime() -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn configure_wasm_runtime() -> Result<PathBuf, DynError> {
     const USER_ENV_KEY: &str = "THEO_VAULT_WASM_PATH";
     const PQCNET_ENV_KEY: &str = "PQCNET_WASM_PATH";
     const WASM_FILE: &str = "autheo_pqc_wasm.wasm";
@@ -165,22 +216,47 @@ or point {} to the file before running theo-vault.",
     .into())
 }
 
-#[cfg(feature = "windows-overlay")]
-fn register_shell_overlay() -> Result<(), Box<dyn std::error::Error>> {
+#[cfg(all(windows, feature = "windows-overlay"))]
+fn register_shell_overlay() -> Result<(), DynError> {
     use winreg::enums::*;
     use winreg::RegKey;
 
     let hkcr = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(
-        "Software\\Classes\\*\\shell\\pqc-vault", KEY_WRITE
+        "Software\\Classes\\*\\shell\\pqc-vault",
+        KEY_WRITE,
     )?;
     hkcr.set_value("", &"Open with Theo Vault")?;
     hkcr.set_value("Icon", &r"C:\Program Files\Theo\icon.ico")?;
     Ok(())
 }
 
-#[cfg(feature = "windows-overlay")]
-fn apply_encrypted_overlay(path: &PathBuf) {
+#[cfg(all(windows, feature = "windows-overlay"))]
+fn apply_overlay_to_folder(path: &PathBuf) -> Result<(), DynError> {
+    apply_encrypted_overlay(path)
+}
+
+#[cfg(all(windows, feature = "windows-overlay"))]
+fn apply_encrypted_overlay(_path: &PathBuf) -> Result<(), DynError> {
     // Real Windows IOverlayIcon implementation
     // Shows green padlock on .pqc files and folders
+    Ok(())
+}
+
+#[cfg(not(all(windows, feature = "windows-overlay")))]
+#[allow(dead_code)]
+fn register_shell_overlay() -> Result<(), DynError> {
+    Ok(())
+}
+
+#[cfg(not(all(windows, feature = "windows-overlay")))]
+#[allow(dead_code)]
+fn apply_overlay_to_folder(_path: &PathBuf) -> Result<(), DynError> {
+    Ok(())
+}
+
+#[cfg(not(all(windows, feature = "windows-overlay")))]
+#[allow(dead_code)]
+fn apply_encrypted_overlay(_path: &PathBuf) -> Result<(), DynError> {
+    Ok(())
 }
 
