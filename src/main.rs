@@ -2,10 +2,12 @@ use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use pqcnet::kem::MlKem1024;
 use pqcnet::sig::Dilithium5;
 use std::env;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -32,6 +34,38 @@ struct TupleEntry {
     original: PathBuf,
     encrypted: PathBuf,
     timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug)]
+struct FileLockedError {
+    path: PathBuf,
+    source: io::Error,
+}
+
+impl FileLockedError {
+    fn new(path: &PathBuf, source: io::Error) -> Self {
+        Self {
+            path: path.clone(),
+            source,
+        }
+    }
+}
+
+impl fmt::Display for FileLockedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "file '{}' is locked by another process ({})",
+            self.path.display(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for FileLockedError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 impl TupleChain {
@@ -151,13 +185,31 @@ impl Vault {
     }
 
     fn encrypt_file(&self, path: &PathBuf) -> Result<(), DynError> {
-        let data = match fs::read(path) {
-            Ok(data) => data,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                // File vanished between the event and the read—treat as benign.
-                return Ok(());
+        const LOCK_RETRY_MAX_ATTEMPTS: u8 = 10;
+        const LOCK_RETRY_BACKOFF_MS: u64 = 150;
+
+        let data = {
+            let mut attempt: u8 = 0;
+            loop {
+                match fs::read(path) {
+                    Ok(data) => break data,
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                        // File vanished between the event and the read—treat as benign.
+                        return Ok(());
+                    }
+                    Err(err) if is_file_in_use_error(&err) && attempt < LOCK_RETRY_MAX_ATTEMPTS => {
+                        attempt += 1;
+                        std::thread::sleep(Duration::from_millis(
+                            LOCK_RETRY_BACKOFF_MS * attempt as u64,
+                        ));
+                        continue;
+                    }
+                    Err(err) if is_file_in_use_error(&err) => {
+                        return Err(FileLockedError::new(path, err).into());
+                    }
+                    Err(err) => return Err(err.into()),
+                }
             }
-            Err(err) => return Err(err.into()),
         };
         let (ct, ss) = self.keypair.encapsulate()?;
 
@@ -222,7 +274,20 @@ impl Vault {
             return Ok(());
         }
 
-        self.encrypt_file(path)
+        match self.encrypt_file(path) {
+            Ok(()) => Ok(()),
+            Err(err) => match err.downcast::<FileLockedError>() {
+                Ok(file_locked) => {
+                    let FileLockedError { path, source } = *file_locked;
+                    eprintln!(
+                        "file is currently in use; deferring encryption until it's released: {} ({source})",
+                        path.display()
+                    );
+                    Ok(())
+                }
+                Err(err) => Err(err),
+            },
+        }
     }
 }
 
@@ -332,6 +397,14 @@ fn apply_overlay_to_folder(_path: &PathBuf) -> Result<(), DynError> {
 #[allow(dead_code)]
 fn apply_encrypted_overlay(_path: &PathBuf) -> Result<(), DynError> {
     Ok(())
+}
+
+fn is_file_in_use_error(err: &io::Error) -> bool {
+    if cfg!(windows) {
+        matches!(err.raw_os_error(), Some(32) | Some(33))
+    } else {
+        false
+    }
 }
 
 #[cfg(test)]
