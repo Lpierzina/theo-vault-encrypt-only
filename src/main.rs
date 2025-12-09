@@ -120,10 +120,8 @@ fn main() -> Result<(), DynError> {
             notify::EventKind::Create(_) | notify::EventKind::Modify(_)
         ) {
             for path in event.paths {
-                if path.extension().map_or(true, |e| e != "pqc") {
-                    if let Err(err) = vault.encrypt_file(&path) {
-                        eprintln!("encrypt error for {}: {err}", path.display());
-                    }
+                if let Err(err) = vault.encrypt_plain_file_if_needed(&path) {
+                    eprintln!("encrypt error for {}: {err}", path.display());
                 }
             }
         }
@@ -178,6 +176,26 @@ impl Vault {
         // Zeroize plaintext from RAM
         drop(data);
         Ok(())
+    }
+
+    fn encrypt_plain_file_if_needed(&self, path: &PathBuf) -> Result<(), DynError> {
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(format!("metadata error: {err}").into());
+            }
+        };
+
+        if !metadata.is_file() {
+            return Ok(());
+        }
+
+        if path.extension().map_or(false, |e| e == "pqc") {
+            return Ok(());
+        }
+
+        self.encrypt_file(path)
     }
 }
 
@@ -335,6 +353,31 @@ mod tests {
         let last = chain.entries.last().expect("tuplechain entry recorded");
         assert_eq!(last.original, plaintext);
         assert_eq!(last.encrypted, encrypted);
+
+        Ok(())
+    }
+
+    #[test]
+    fn directory_events_are_ignored() -> Result<(), DynError> {
+        let temp = tempdir().expect("temp dir");
+        let vault_dir = temp.path().join("vault");
+        let vault = Vault::init(vault_dir.clone())?;
+
+        let nested_dir = vault_dir.join("nested");
+        fs::create_dir(&nested_dir)?;
+
+        vault.encrypt_plain_file_if_needed(&nested_dir)?;
+
+        assert!(
+            !nested_dir.with_extension("pqc").exists(),
+            "directories should not produce encrypted bundles"
+        );
+
+        let chain = vault.tuplechain.lock().unwrap();
+        assert!(
+            chain.entries.is_empty(),
+            "directory events should not mint tuple entries"
+        );
 
         Ok(())
     }
