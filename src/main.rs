@@ -190,6 +190,11 @@ impl Vault {
             }
         };
 
+        if metadata.is_dir() {
+            // Directories are allowed; files within them will be processed individually.
+            return Ok(());
+        }
+
         if !metadata.is_file() {
             return Err(format!(
                 "unauthorized non-file entry detected ({}). Vaults are immutable; no folders or special files allowed.",
@@ -365,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn directory_events_trigger_errors() -> Result<(), DynError> {
+    fn directory_events_are_ignored() -> Result<(), DynError> {
         let temp = tempdir().expect("temp dir");
         let vault_dir = temp.path().join("vault");
         let vault = Vault::init(vault_dir.clone())?;
@@ -373,12 +378,14 @@ mod tests {
         let nested_dir = vault_dir.join("nested");
         fs::create_dir(&nested_dir)?;
 
-        let err = vault
+        vault
             .encrypt_plain_file_if_needed(&nested_dir)
-            .expect_err("directories must be treated as integrity violations");
+            .expect("directories should be ignored");
+
+        let chain = vault.tuplechain.lock().unwrap();
         assert!(
-            err.to_string().contains("non-file entry") || err.to_string().contains("immutable"),
-            "error message should call out unauthorized directory handling"
+            chain.entries.is_empty(),
+            "directories should not mint tuplechain entries"
         );
 
         Ok(())
