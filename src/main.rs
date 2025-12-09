@@ -17,8 +17,8 @@ struct Vault {
 
 #[derive(Clone)]
 struct KeyPair {
-    kem_sk: Vec<u8>,
-    sig_sk: Vec<u8>,
+    kem: MlKem1024,
+    sig: Dilithium5,
 }
 
 #[derive(Clone, Default)]
@@ -53,9 +53,33 @@ impl TupleChain {
         });
 
         const MAX_ENTRIES: usize = 2048;
+        const MAX_RETENTION_HOURS: i64 = 24;
+
+        let cutoff = timestamp - chrono::Duration::hours(MAX_RETENTION_HOURS);
+        self.entries
+            .retain(|entry| entry.timestamp >= cutoff);
+
         if self.entries.len() > MAX_ENTRIES {
             self.entries.drain(0..(self.entries.len() - MAX_ENTRIES));
         }
+    }
+}
+
+impl KeyPair {
+    fn new() -> Result<Self, DynError> {
+        Ok(Self {
+            kem: MlKem1024::new()?,
+            sig: Dilithium5::new()?,
+        })
+    }
+
+    fn encapsulate(&self) -> Result<(Vec<u8>, Vec<u8>), DynError> {
+        let (pk, _) = self.kem.keypair()?;
+        self.kem.encapsulate(&pk)
+    }
+
+    fn sign(&self, payload: &[u8]) -> Result<Vec<u8>, DynError> {
+        self.sig.sign(payload)
     }
 }
 
@@ -111,12 +135,7 @@ impl Vault {
     fn init(path: PathBuf) -> Result<Self, DynError> {
         fs::create_dir_all(&path)?;
 
-        let kem = MlKem1024::new()?;
-        let sig = Dilithium5::new()?;
-        let (_, kem_sk) = kem.keypair()?;
-        let (_, sig_sk) = sig.keypair()?;
-
-        let keypair = KeyPair { kem_sk, sig_sk };
+        let keypair = KeyPair::new()?;
         let tuplechain = Arc::new(Mutex::new(TupleChain::new()));
 
         #[cfg(all(windows, feature = "windows-overlay"))]
@@ -131,12 +150,10 @@ impl Vault {
 
     fn encrypt_file(&self, path: &PathBuf) -> Result<(), DynError> {
         let data = fs::read(path)?;
-        let kem = MlKem1024::new()?;
-        let (pk, _) = kem.keypair()?;
-        let (ct, ss) = kem.encapsulate(&pk)?;
+        let (ct, ss) = self.keypair.encapsulate()?;
 
         let encrypted = pqcnet::encrypt_aes_gcm_siv(&ss, &data)?;
-        let signature = Dilithium5::new()?.sign(&encrypted)?;
+        let signature = self.keypair.sign(&encrypted)?;
 
         let bundle = bincode::serialize(&(
             ct,
