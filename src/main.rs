@@ -3,6 +3,7 @@ use pqcnet::kem::MlKem1024;
 use pqcnet::sig::Dilithium5;
 use std::env;
 use std::fs;
+use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -150,7 +151,14 @@ impl Vault {
     }
 
     fn encrypt_file(&self, path: &PathBuf) -> Result<(), DynError> {
-        let data = fs::read(path)?;
+        let data = match fs::read(path) {
+            Ok(data) => data,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                // File vanished between the event and the read—treat as benign.
+                return Ok(());
+            }
+            Err(err) => return Err(err.into()),
+        };
         let (ct, ss) = self.keypair.encapsulate()?;
 
         let encrypted = pqcnet::encrypt_aes_gcm_siv(&ss, &data)?;
@@ -164,7 +172,14 @@ impl Vault {
         ))?;
 
         let encrypted_path = path.with_extension("pqc");
-        fs::write(&encrypted_path, bundle)?;
+        match fs::write(&encrypted_path, bundle) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                // Folder disappeared before we could persist the bundle.
+                return Ok(());
+            }
+            Err(err) => return Err(err.into()),
+        }
 
         #[cfg(all(windows, feature = "windows-overlay"))]
         apply_encrypted_overlay(&encrypted_path)?;
