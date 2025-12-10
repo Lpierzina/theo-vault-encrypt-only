@@ -1,11 +1,13 @@
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use pqcnet::kem::MlKem1024;
 use pqcnet::sig::Dilithium5;
+use std::collections::VecDeque;
 use std::env;
+use std::ffi::OsStr;
 use std::fmt::{self, Write as FmtWrite};
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -187,19 +189,32 @@ fn main() -> Result<(), DynError> {
             }
         };
 
-        if matches!(
-            event.kind,
-            notify::EventKind::Create(_) | notify::EventKind::Modify(_)
-        ) {
-            for path in event.paths {
-                if let Err(err) = vault.encrypt_plain_file_if_needed(&path) {
-                    eprintln!(
-                        "vault integrity violation detected at {}: {err}",
-                        path.display()
-                    );
-                    std::process::exit(1);
+        let notify::Event { kind, paths, .. } = event;
+
+        match kind {
+            notify::EventKind::Create(_) | notify::EventKind::Modify(_) => {
+                for path in paths {
+                    if let Err(err) = vault.encrypt_plain_file_if_needed(&path) {
+                        eprintln!(
+                            "vault integrity violation detected at {}: {err}",
+                            path.display()
+                        );
+                        std::process::exit(1);
+                    }
                 }
             }
+            notify::EventKind::Remove(_) => {
+                for path in paths {
+                    if let Err(err) = vault.guard_against_deletion(&path) {
+                        eprintln!(
+                            "vault integrity violation detected at {}: {err}",
+                            path.display()
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -318,6 +333,10 @@ impl Vault {
     }
 
     fn encrypt_plain_file_if_needed(&self, path: &PathBuf) -> Result<(), DynError> {
+        if self.is_quarantine_path(path) {
+            return Ok(());
+        }
+
         let metadata = match fs::metadata(path) {
             Ok(metadata) => metadata,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -327,10 +346,7 @@ impl Vault {
         };
 
         if metadata.is_dir() {
-            // Directories are allowed; files within them will be processed individually.
-            if path != &self.path {
-                self.emit_folder_ingest_proof(path);
-            }
+            self.quarantine_folder(path)?;
             return Ok(());
         }
 
@@ -362,6 +378,198 @@ impl Vault {
         }
     }
 
+    fn guard_against_deletion(&self, path: &PathBuf) -> Result<(), DynError> {
+        if !path.starts_with(&self.path) {
+            return Ok(());
+        }
+
+        if self.is_quarantine_path(path) {
+            return Ok(());
+        }
+
+        let is_sealed_artifact = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("pqc"))
+            .unwrap_or(false);
+
+        if is_sealed_artifact {
+            return Err(format!(
+                "sealed Theo Vault artifact '{}' was deleted; this vault is immutable.",
+                path.display()
+            )
+            .into());
+        }
+
+        Ok(())
+    }
+
+    fn is_quarantine_path(&self, path: &Path) -> bool {
+        path.strip_prefix(&self.path)
+            .ok()
+            .map(|relative| {
+                relative
+                    .components()
+                    .any(|component| component.as_os_str() == ".theo-quarantine")
+            })
+            .unwrap_or(false)
+    }
+
+    fn quarantine_folder(&self, folder: &PathBuf) -> Result<(), DynError> {
+        if folder == &self.path || self.is_quarantine_path(folder) {
+            return Ok(());
+        }
+
+        let quarantine_root = self.path.join(".theo-quarantine");
+        fs::create_dir_all(&quarantine_root)?;
+
+        let original_name = folder
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "vault-drop".to_string());
+        let drop_label = Self::sanitize_component(OsStr::new(&original_name));
+
+        let timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let mut attempt: u32 = 0;
+        let drop_dir = loop {
+            let suffix = if attempt == 0 {
+                String::new()
+            } else {
+                format!("-{attempt}")
+            };
+            let candidate = quarantine_root.join(format!("{timestamp:x}-{original_name}{suffix}"));
+            if !candidate.exists() {
+                break candidate;
+            }
+            attempt = attempt.saturating_add(1);
+        };
+
+        match fs::rename(folder, &drop_dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err.into()),
+        }
+
+        self.emit_folder_ingest_proof(folder, &drop_dir);
+        self.flatten_quarantined_drop(&drop_dir, &drop_label)?;
+        let _ = fs::remove_dir_all(&drop_dir);
+        self.cleanup_quarantine_root(&quarantine_root);
+        Ok(())
+    }
+
+    fn flatten_quarantined_drop(
+        &self,
+        drop_root: &PathBuf,
+        drop_label: &str,
+    ) -> Result<(), DynError> {
+        let mut queue = VecDeque::new();
+        queue.push_back(drop_root.clone());
+
+        while let Some(dir) = queue.pop_front() {
+            for entry in fs::read_dir(&dir)? {
+                let entry = entry?;
+                let entry_path = entry.path();
+                if entry_path.is_dir() {
+                    queue.push_back(entry_path);
+                    continue;
+                }
+                if !entry_path.is_file() {
+                    continue;
+                }
+
+                let relative = entry_path.strip_prefix(drop_root).map_err(|_| {
+                    format!(
+                        "unable to derive relative path for quarantined file {}",
+                        entry_path.display()
+                    )
+                })?;
+
+                let relative_name = Self::flatten_relative_path(relative)?;
+                let dest_name = if drop_label.is_empty() {
+                    relative_name
+                } else {
+                    format!("{drop_label}__{relative_name}")
+                };
+                let dest_path = self.path.join(&dest_name);
+
+                if dest_path.exists() {
+                    return Err(format!(
+                        "flattening aborted: destination {} already exists",
+                        dest_path.display()
+                    )
+                    .into());
+                }
+
+                fs::rename(&entry_path, &dest_path)?;
+                self.encrypt_plain_file_if_needed(&dest_path)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn flatten_relative_path(relative: &Path) -> Result<String, DynError> {
+        use std::path::Component;
+
+        let mut pieces = Vec::new();
+        for component in relative.components() {
+            match component {
+                Component::Normal(seg) => {
+                    let sanitized = Self::sanitize_component(seg);
+                    if sanitized.is_empty() {
+                        return Err("encountered empty path component during flatten".into());
+                    }
+                    pieces.push(sanitized);
+                }
+                Component::CurDir => continue,
+                Component::ParentDir => {
+                    return Err("folder drops cannot reference parent directories".into());
+                }
+                Component::RootDir | Component::Prefix(_) => {
+                    return Err("folder drops must be relative paths".into());
+                }
+            }
+        }
+
+        if pieces.is_empty() {
+            return Err("quarantine entry missing relative path".into());
+        }
+
+        Ok(pieces.join("__"))
+    }
+
+    fn sanitize_component(segment: &OsStr) -> String {
+        let value = segment.to_string_lossy();
+        let sanitized: String = value
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+
+        if sanitized.trim_matches('_').is_empty() {
+            "entry".to_string()
+        } else {
+            sanitized
+        }
+    }
+
+    fn cleanup_quarantine_root(&self, quarantine_root: &Path) {
+        match fs::read_dir(quarantine_root) {
+            Ok(mut entries) => {
+                if entries.next().is_none() {
+                    let _ = fs::remove_dir(quarantine_root);
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => {}
+        }
+    }
+
     fn purge_plaintext(&self, path: &PathBuf) -> Result<(), DynError> {
         match fs::remove_file(path) {
             Ok(()) => Ok(()),
@@ -370,15 +578,20 @@ impl Vault {
         }
     }
 
-    fn emit_folder_ingest_proof(&self, folder: &PathBuf) {
+    fn emit_folder_ingest_proof(&self, original: &Path, quarantine: &Path) {
         let timestamp = chrono::Utc::now();
         println!();
         println!(
             "════ Theo Vault PQC Intake @ {} ════",
             timestamp.to_rfc3339()
         );
-        println!("Folder pasted into vault: {}", folder.display());
-        println!("ML-KEM-1024 public key: {}", self.keypair.mlkem_public_hex());
+        println!("Folder pasted into vault: {}", original.display());
+        println!("Quarantined drop: {}", quarantine.display());
+        println!("Theo Vault will flatten every file into the root and forbid directories from persisting.");
+        println!(
+            "ML-KEM-1024 public key: {}",
+            self.keypair.mlkem_public_hex()
+        );
         println!(
             "Dilithium5 public key: {}",
             self.keypair.dilithium_public_hex()
@@ -417,25 +630,14 @@ impl Vault {
             sealed_len,
             sealed_hash
         );
-        println!(
-            "ML-KEM  ▸ pk {}",
-            self.keypair.mlkem_public_hex()
-        );
+        println!("ML-KEM  ▸ pk {}", self.keypair.mlkem_public_hex());
         println!(
             "          ct {} | shared {}",
-            kem_ciphertext_hash,
-            shared_secret_hash
+            kem_ciphertext_hash, shared_secret_hash
         );
-        println!(
-            "Dilithium ▸ pk {}",
-            self.keypair.dilithium_public_hex()
-        );
+        println!("Dilithium ▸ pk {}", self.keypair.dilithium_public_hex());
         println!("            signature {}", signature_hash);
-        println!(
-            "TupleChain ▸ entry #{} committed @ {}",
-            tuple_id,
-            timestamp
-        );
+        println!("TupleChain ▸ entry #{} committed @ {}", tuple_id, timestamp);
         println!("Proof complete — ready to paste into your vaulted document.\n");
     }
 }
@@ -611,23 +813,76 @@ mod tests {
     }
 
     #[test]
-    fn directory_events_are_ignored() -> Result<(), DynError> {
+    fn directory_events_are_quarantined_and_flattened() -> Result<(), DynError> {
         let temp = tempdir().expect("temp dir");
         let vault_dir = temp.path().join("vault");
         let vault = Vault::init(vault_dir.clone())?;
 
-        let nested_dir = vault_dir.join("nested");
-        fs::create_dir(&nested_dir)?;
+        let drop_dir = vault_dir.join("drop");
+        let nested_dir = drop_dir.join("nested").join("deep");
+        fs::create_dir_all(&nested_dir)?;
+        let inner_file = nested_dir.join("note.txt");
+        fs::write(&inner_file, b"secret payload")?;
 
         vault
-            .encrypt_plain_file_if_needed(&nested_dir)
-            .expect("directories should be ignored");
+            .encrypt_plain_file_if_needed(&drop_dir)
+            .expect("directories should be quarantined");
 
-        let chain = vault.tuplechain.lock().unwrap();
         assert!(
-            chain.entries.is_empty(),
-            "directories should not mint tuplechain entries"
+            !drop_dir.exists(),
+            "original folder should be removed after flattening"
         );
+
+        let flattened_plaintext = vault_dir.join("drop__nested__deep__note.txt");
+        assert!(
+            !flattened_plaintext.exists(),
+            "plaintext should be removed after sealing"
+        );
+
+        let sealed = vault_dir.join("drop__nested__deep__note.pqc");
+        assert!(sealed.exists(), "flattened .pqc artifact should exist");
+
+        let quarantine_root = vault_dir.join(".theo-quarantine");
+        assert!(
+            !quarantine_root.exists(),
+            "quarantine staging area should be cleaned up when empty"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn deleting_pqc_artifacts_triggers_violation() -> Result<(), DynError> {
+        let temp = tempdir().expect("temp dir");
+        let vault_dir = temp.path().join("vault");
+        let vault = Vault::init(vault_dir.clone())?;
+
+        let sealed = vault_dir.join("note.pqc");
+        fs::write(&sealed, b"sealed")?;
+
+        let err = vault
+            .guard_against_deletion(&sealed)
+            .expect_err("sealed files cannot be deleted");
+        assert!(
+            err.to_string().contains("immutable"),
+            "error message should mention immutability"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn deleting_plaintext_paths_is_ignored() -> Result<(), DynError> {
+        let temp = tempdir().expect("temp dir");
+        let vault_dir = temp.path().join("vault");
+        let vault = Vault::init(vault_dir.clone())?;
+
+        let plaintext = vault_dir.join("note.txt");
+        fs::write(&plaintext, b"temporary")?;
+
+        vault
+            .guard_against_deletion(&plaintext)
+            .expect("plaintext removals are ignored during ingestion");
 
         Ok(())
     }
