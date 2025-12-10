@@ -36,6 +36,8 @@ struct Vault {
     keypair: KeyPair,
     tuplechain: Arc<Mutex<TupleChain>>,
     sanctioned_removals: Arc<Mutex<HashSet<PathBuf>>>,
+    sanctioned_directories: Arc<Mutex<HashSet<PathBuf>>>,
+    known_directories: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 #[derive(Clone)]
@@ -198,6 +200,29 @@ fn main() -> Result<(), DynError> {
         match event.kind {
             notify::EventKind::Create(_) => {
                 for path in event.paths {
+                    // Explicitly check for directory creation first
+                    if let Ok(metadata) = fs::metadata(&path) {
+                        if metadata.is_dir() {
+                            // Track this directory so we know it's a directory when it's removed
+                            {
+                                if let Ok(mut known_dirs) = vault.known_directories.lock() {
+                                    known_dirs.insert(path.clone());
+                                }
+                            }
+                            
+                            if !vault.is_directory_sanctioned(&path) {
+                                eprintln!(
+                                    "vault integrity violation detected at {}: directories cannot be added to immutable vaults ({})",
+                                    path.display(),
+                                    path.display()
+                                );
+                                std::process::exit(1);
+                            }
+                            // Directory is sanctioned, allow it
+                            continue;
+                        }
+                    }
+                    // Handle file creation
                     if let Err(err) = vault.encrypt_plain_file_if_needed(
                         &path,
                         DirectoryPolicy::ForbidNewEntries,
@@ -251,12 +276,49 @@ impl Vault {
         #[cfg(all(windows, feature = "windows-overlay"))]
         apply_overlay_to_folder(&path)?;
 
-        Ok(Vault {
-            path,
+        let mut known_dirs = HashSet::new();
+        known_dirs.insert(path.clone());
+        
+        // Scan and track existing directories
+        Self::scan_and_track_directories(&path, &mut known_dirs)?;
+        
+        let vault = Vault {
+            path: path.clone(),
             keypair,
             tuplechain,
             sanctioned_removals: Arc::new(Mutex::new(HashSet::new())),
-        })
+            sanctioned_directories: Arc::new(Mutex::new(HashSet::new())),
+            known_directories: Arc::new(Mutex::new(known_dirs)),
+        };
+        
+        // Sanction all existing directories (they were there before vault init)
+        if let Ok(mut dir_ledger) = vault.sanctioned_directories.lock() {
+            if let Ok(known_dirs) = vault.known_directories.lock() {
+                for dir in known_dirs.iter() {
+                    if dir != &vault.path {
+                        dir_ledger.insert(dir.clone());
+                    }
+                }
+            }
+        }
+        
+        Ok(vault)
+    }
+
+    fn scan_and_track_directories(root: &PathBuf, known_dirs: &mut HashSet<PathBuf>) -> Result<(), DynError> {
+        let entries = fs::read_dir(root)?;
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if let Ok(metadata) = fs::metadata(&path) {
+                if metadata.is_dir() {
+                    known_dirs.insert(path.clone());
+                    // Recursively scan subdirectories
+                    Self::scan_and_track_directories(&path, known_dirs)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn authorize_internal_removal(&self, path: &PathBuf) {
@@ -265,11 +327,59 @@ impl Vault {
         }
     }
 
+    fn authorize_directory_creation(&self, path: &PathBuf) {
+        if let Ok(mut ledger) = self.sanctioned_directories.lock() {
+            ledger.insert(path.clone());
+        }
+        // Also track it as a known directory
+        if let Ok(mut known_dirs) = self.known_directories.lock() {
+            known_dirs.insert(path.clone());
+        }
+    }
+
+    fn is_directory_sanctioned(&self, path: &PathBuf) -> bool {
+        if path == &self.path {
+            return true;
+        }
+        if let Ok(ledger) = self.sanctioned_directories.lock() {
+            ledger.contains(path)
+        } else {
+            false
+        }
+    }
+
     fn guard_external_removal(&self, path: &PathBuf) -> Result<(), DynError> {
         if path == &self.path {
             return Err("vault root cannot be removed while Theo Vault is active".into());
         }
 
+        // Check if it's a known directory (since we can't check metadata after removal)
+        let is_directory = {
+            let known_dirs = self.known_directories.lock().unwrap();
+            known_dirs.contains(path)
+        };
+
+        if is_directory {
+            // Directories can only be removed if they're in the sanctioned removals set
+            let mut removal_ledger = self.sanctioned_removals.lock().unwrap();
+            if removal_ledger.remove(path) {
+                // Also remove from tracking sets
+                if let Ok(mut dir_ledger) = self.sanctioned_directories.lock() {
+                    dir_ledger.remove(path);
+                }
+                if let Ok(mut known_dirs) = self.known_directories.lock() {
+                    known_dirs.remove(path);
+                }
+                return Ok(());
+            }
+            return Err(format!(
+                "vault integrity violation: directory deletion detected at {}",
+                path.display()
+            )
+            .into());
+        }
+
+        // For files, check the sanctioned removals ledger
         let mut ledger = self.sanctioned_removals.lock().unwrap();
         if ledger.remove(path) {
             return Ok(());
