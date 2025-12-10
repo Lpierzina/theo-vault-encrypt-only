@@ -2,7 +2,7 @@ use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use pqcnet::kem::MlKem1024;
 use pqcnet::sig::Dilithium5;
 use std::env;
-use std::fmt;
+use std::fmt::{self, Write as FmtWrite};
 use std::fs;
 use std::io;
 use std::path::PathBuf;
@@ -10,6 +10,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(&mut out, "{:02x}", byte);
+    }
+    out
+}
+
+fn blake3_hex(data: &[u8]) -> String {
+    blake3::hash(data).to_hex().to_string()
+}
 
 #[derive(Clone)]
 struct Vault {
@@ -21,12 +33,16 @@ struct Vault {
 #[derive(Clone)]
 struct KeyPair {
     kem: MlKem1024,
+    kem_public_key: Vec<u8>,
+    kem_public_hex: String,
     sig: Dilithium5,
+    sig_public_hex: String,
 }
 
 #[derive(Clone, Default)]
 struct TupleChain {
     entries: Vec<TupleEntry>,
+    minted_total: u64,
 }
 
 #[derive(Clone)]
@@ -72,6 +88,7 @@ impl TupleChain {
     fn new() -> Self {
         Self {
             entries: Vec::with_capacity(64),
+            minted_total: 0,
         }
     }
 
@@ -80,7 +97,7 @@ impl TupleChain {
         original: &PathBuf,
         encrypted: &PathBuf,
         timestamp: chrono::DateTime<chrono::Utc>,
-    ) {
+    ) -> u64 {
         self.entries.push(TupleEntry {
             original: original.clone(),
             encrypted: encrypted.clone(),
@@ -96,24 +113,45 @@ impl TupleChain {
         if self.entries.len() > MAX_ENTRIES {
             self.entries.drain(0..(self.entries.len() - MAX_ENTRIES));
         }
+
+        self.minted_total = self.minted_total.saturating_add(1);
+        self.minted_total
     }
 }
 
 impl KeyPair {
     fn new() -> Result<Self, DynError> {
+        let kem = MlKem1024::new()?;
+        let (kem_public_key, _) = kem.keypair()?;
+        let kem_public_hex = hex_encode(&kem_public_key);
+
+        let sig = Dilithium5::new()?;
+        let (sig_public_key, _) = sig.keypair()?;
+        let sig_public_hex = hex_encode(&sig_public_key);
+
         Ok(Self {
-            kem: MlKem1024::new()?,
-            sig: Dilithium5::new()?,
+            kem,
+            kem_public_key,
+            kem_public_hex,
+            sig,
+            sig_public_hex,
         })
     }
 
     fn encapsulate(&self) -> Result<(Vec<u8>, Vec<u8>), DynError> {
-        let (pk, _) = self.kem.keypair()?;
-        self.kem.encapsulate(&pk)
+        self.kem.encapsulate(&self.kem_public_key)
     }
 
     fn sign(&self, payload: &[u8]) -> Result<Vec<u8>, DynError> {
         self.sig.sign(payload)
+    }
+
+    fn mlkem_public_hex(&self) -> &str {
+        &self.kem_public_hex
+    }
+
+    fn dilithium_public_hex(&self) -> &str {
+        &self.sig_public_hex
     }
 }
 
@@ -212,11 +250,15 @@ impl Vault {
             }
         };
         let plaintext_len = data.len();
+        let plaintext_hash = blake3_hex(&data);
 
         let (ct, ss) = self.keypair.encapsulate()?;
+        let kem_ciphertext_hash = blake3_hex(&ct);
+        let shared_secret_hash = blake3_hex(&ss);
 
         let encrypted = pqcnet::encrypt_aes_gcm_siv(&ss, &data)?;
         let signature = self.keypair.sign(&encrypted)?;
+        let signature_hash = blake3_hex(&signature);
 
         let bundle = bincode::serialize(&(
             ct,
@@ -224,9 +266,11 @@ impl Vault {
             signature,
             path.file_name().unwrap().to_string_lossy(),
         ))?;
+        let sealed_len = bundle.len();
+        let sealed_hash = blake3_hex(&bundle);
 
         let encrypted_path = path.with_extension("pqc");
-        match fs::write(&encrypted_path, bundle) {
+        match fs::write(&encrypted_path, &bundle) {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 // Folder disappeared before we could persist the bundle.
@@ -247,11 +291,25 @@ impl Vault {
         #[cfg(all(windows, feature = "windows-overlay"))]
         apply_encrypted_overlay(&encrypted_path)?;
 
+        let proof_timestamp = chrono::Utc::now();
         // Mint TupleChain entry
-        self.tuplechain.lock().unwrap().mint_encrypted_file(
+        let tuple_sequence = {
+            let mut chain = self.tuplechain.lock().unwrap();
+            chain.mint_encrypted_file(path, &encrypted_path, proof_timestamp)
+        };
+
+        self.emit_file_proof(
             path,
             &encrypted_path,
-            chrono::Utc::now(),
+            plaintext_len,
+            &plaintext_hash,
+            sealed_len,
+            &sealed_hash,
+            &kem_ciphertext_hash,
+            &shared_secret_hash,
+            &signature_hash,
+            tuple_sequence,
+            proof_timestamp,
         );
 
         // Zeroize plaintext from RAM
@@ -270,6 +328,9 @@ impl Vault {
 
         if metadata.is_dir() {
             // Directories are allowed; files within them will be processed individually.
+            if path != &self.path {
+                self.emit_folder_ingest_proof(path);
+            }
             return Ok(());
         }
 
@@ -307,6 +368,75 @@ impl Vault {
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(err.into()),
         }
+    }
+
+    fn emit_folder_ingest_proof(&self, folder: &PathBuf) {
+        let timestamp = chrono::Utc::now();
+        println!();
+        println!(
+            "════ Theo Vault PQC Intake @ {} ════",
+            timestamp.to_rfc3339()
+        );
+        println!("Folder pasted into vault: {}", folder.display());
+        println!("ML-KEM-1024 public key: {}", self.keypair.mlkem_public_hex());
+        println!(
+            "Dilithium5 public key: {}",
+            self.keypair.dilithium_public_hex()
+        );
+        println!("Every file inside will emit BEFORE/AFTER PQC proofs.");
+        println!("══════════════════════════════════════════");
+    }
+
+    fn emit_file_proof(
+        &self,
+        original: &PathBuf,
+        encrypted: &PathBuf,
+        plaintext_len: usize,
+        plaintext_hash: &str,
+        sealed_len: usize,
+        sealed_hash: &str,
+        kem_ciphertext_hash: &str,
+        shared_secret_hash: &str,
+        signature_hash: &str,
+        tuple_id: u64,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) {
+        println!(
+            "──── Theo Vault PQC Proof @ {} ────",
+            timestamp.to_rfc3339()
+        );
+        println!(
+            "Before ▸ {} ({} bytes, blake3 {})",
+            original.display(),
+            plaintext_len,
+            plaintext_hash
+        );
+        println!(
+            "After  ▸ {} ({} bytes, blake3 {})",
+            encrypted.display(),
+            sealed_len,
+            sealed_hash
+        );
+        println!(
+            "ML-KEM  ▸ pk {}",
+            self.keypair.mlkem_public_hex()
+        );
+        println!(
+            "          ct {} | shared {}",
+            kem_ciphertext_hash,
+            shared_secret_hash
+        );
+        println!(
+            "Dilithium ▸ pk {}",
+            self.keypair.dilithium_public_hex()
+        );
+        println!("            signature {}", signature_hash);
+        println!(
+            "TupleChain ▸ entry #{} committed @ {}",
+            tuple_id,
+            timestamp
+        );
+        println!("Proof complete — ready to paste into your vaulted document.\n");
     }
 }
 

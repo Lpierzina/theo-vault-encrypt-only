@@ -52,6 +52,33 @@ THEO_VAULT_WASM_PATH=/absolute/path/autheo_pqc_wasm.wasm \
 - When the runtime boots you will see `Autheo PQC runtime loaded from <path>`—if you do not see that line, the WASM was not found and PQCNet will refuse to operate.
 - For production deployments bundle `autheo_pqc_wasm.wasm` next to the binary (e.g., `theo-vault.exe` and a sibling `wasm/` directory) so the watcher works without additional flags.
 
+## Live PQC Proof Output
+- Drop any folder into your vault path and Theo Vault now prints a dedicated proof block before a single byte leaves disk.
+- The folder ingest banner shows the exact ML-KEM-1024 and Dilithium5 public keys that will be used for every file in that drop.
+- Each file that becomes `.pqc` produces a BEFORE/AFTER transcript with BLAKE3 hashes, ML-KEM ciphertext + shared-secret fingerprints, and the Dilithium signature hash so you can paste the proof anywhere.
+- TupleChain entry numbers are included so anyone can correlate a sealed artifact with the immutable ledger kept on your device.
+
+Example console output:
+
+```
+════ Theo Vault PQC Intake @ 2025-12-10T20:11:05Z ════
+Folder pasted into vault: /Users/aeria/THEO/BoardDeck
+ML-KEM-1024 public key: 8b1b9e4d8db2c48739814c52f752b3bb137986412d8790e5cdfde3f4b01ef820
+Dilithium5 public key: 36ed6e36af98f719f56430cf6d9ad6dafad16c36c5e3497833d75b7b2ccb0c2d
+Every file inside will emit BEFORE/AFTER PQC proofs.
+══════════════════════════════════════════
+
+──── Theo Vault PQC Proof @ 2025-12-10T20:11:07Z ────
+Before ▸ /Users/aeria/THEO/BoardDeck/plan.docx (742341 bytes, blake3 1a62c0fbd2f5fb3c74a97422d97c4aa8622f0735baf5cf88d3f166d8181cf5f9)
+After  ▸ /Users/aeria/THEO/BoardDeck/plan.pqc (1108912 bytes, blake3 6f8471cb440f876925b6c7aa96a1b3324acdc25ae4da3b15078f054637e7bb8e)
+ML-KEM  ▸ pk 8b1b9e4d8db2c48739814c52f752b3bb137986412d8790e5cdfde3f4b01ef820
+          ct 1bd6f7bd5994f95ec69bfa0ff493fac4e20d9a53808346352c894b1998019f71 | shared 3f8e8697a00b3c951046c9c63e281812ff0b323eb9cf78c6d324eec7903f293f
+Dilithium ▸ pk 36ed6e36af98f719f56430cf6d9ad6dafad16c36c5e3497833d75b7b2ccb0c2d
+            signature 7f67331ac1e17a5a756d9e77bc368b21ba80cc11941a46761a6aeddbef9e1374
+TupleChain ▸ entry #18 committed @ 2025-12-10T20:11:07Z
+Proof complete — ready to paste into your vaulted document.
+```
+
 # About THEO Vault
 ✅ Real-time file encryption (CKKS)
 ✅ Windows green lock overlay (real shell extension)
