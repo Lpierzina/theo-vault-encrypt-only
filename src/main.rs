@@ -395,14 +395,18 @@ impl Vault {
                 return Ok(());
             }
 
-            return match directory_policy {
-                DirectoryPolicy::AllowExisting => Ok(()),
-                DirectoryPolicy::ForbidNewEntries => Err(format!(
+            let violation_message = match directory_policy {
+                DirectoryPolicy::AllowExisting => format!(
+                    "directories cannot be mutated once a vault is immutable ({}).",
+                    path.display()
+                ),
+                DirectoryPolicy::ForbidNewEntries => format!(
                     "directories cannot be added to immutable vaults ({}).",
                     path.display()
-                )
-                .into()),
+                ),
             };
+
+            return Err(violation_message.into());
         }
 
         if !metadata.is_file() {
@@ -688,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn existing_directories_are_ignored() -> Result<(), DynError> {
+    fn existing_directories_trigger_violation_even_on_modify() -> Result<(), DynError> {
         let temp = tempdir().expect("temp dir");
         let vault_dir = temp.path().join("vault");
         let vault = Vault::init(vault_dir.clone())?;
@@ -696,14 +700,12 @@ mod tests {
         let nested_dir = vault_dir.join("nested");
         fs::create_dir(&nested_dir)?;
 
-        vault
+        let err = vault
             .encrypt_plain_file_if_needed(&nested_dir, DirectoryPolicy::AllowExisting)
-            .expect("existing directories should be ignored");
-
-        let chain = vault.tuplechain.lock().unwrap();
+            .expect_err("existing directories should now be treated as violations");
         assert!(
-            chain.entries.is_empty(),
-            "directories should not mint tuplechain entries"
+            err.to_string().contains("cannot be mutated"),
+            "error should describe immutability violation"
         );
 
         Ok(())
