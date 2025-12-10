@@ -1,3 +1,4 @@
+use notify::event::{ModifyKind, RenameMode};
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use pqcnet::kem::MlKem1024;
 use pqcnet::sig::Dilithium5;
@@ -93,6 +94,55 @@ impl std::error::Error for FileLockedError {
         Some(&self.source)
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViolationKind {
+    DirectoryCreation,
+    DirectoryDeletion,
+    FileDeletion,
+    UnauthorizedEntry,
+}
+
+#[derive(Debug)]
+struct VaultViolation {
+    path: PathBuf,
+    kind: ViolationKind,
+    detail: String,
+}
+
+impl VaultViolation {
+    fn new(kind: ViolationKind, path: &PathBuf, detail: impl Into<String>) -> Self {
+        Self {
+            kind,
+            path: path.clone(),
+            detail: detail.into(),
+        }
+    }
+
+    fn directory_creation(path: &PathBuf, detail: impl Into<String>) -> Self {
+        Self::new(ViolationKind::DirectoryCreation, path, detail)
+    }
+
+    fn directory_deletion(path: &PathBuf, detail: impl Into<String>) -> Self {
+        Self::new(ViolationKind::DirectoryDeletion, path, detail)
+    }
+
+    fn file_deletion(path: &PathBuf, detail: impl Into<String>) -> Self {
+        Self::new(ViolationKind::FileDeletion, path, detail)
+    }
+
+    fn unauthorized_entry(path: &PathBuf, detail: impl Into<String>) -> Self {
+        Self::new(ViolationKind::UnauthorizedEntry, path, detail)
+    }
+}
+
+impl fmt::Display for VaultViolation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.detail)
+    }
+}
+
+impl std::error::Error for VaultViolation {}
 
 impl TupleChain {
     fn new() -> Self {
@@ -200,63 +250,37 @@ fn main() -> Result<(), DynError> {
         match event.kind {
             notify::EventKind::Create(_) => {
                 for path in event.paths {
-                    // Explicitly check for directory creation first
-                    if let Ok(metadata) = fs::metadata(&path) {
-                        if metadata.is_dir() {
-                            // Track this directory so we know it's a directory when it's removed
-                            {
-                                if let Ok(mut known_dirs) = vault.known_directories.lock() {
-                                    known_dirs.insert(path.clone());
-                                }
-                            }
-                            
-                            if !vault.is_directory_sanctioned(&path) {
-                                eprintln!(
-                                    "vault integrity violation detected at {}: directories cannot be added to immutable vaults ({})",
-                                    path.display(),
-                                    path.display()
-                                );
-                                std::process::exit(1);
-                            }
-                            // Directory is sanctioned, allow it
-                            continue;
+                    if let Err(err) = vault.process_new_entry(&path) {
+                        if dispatch_enforcement_error(&vault, err) {
+                            std::process::exit(1);
                         }
                     }
-                    // Handle file creation
-                    if let Err(err) = vault.encrypt_plain_file_if_needed(
-                        &path,
-                        DirectoryPolicy::ForbidNewEntries,
-                    ) {
-                        eprintln!(
-                            "vault integrity violation detected at {}: {err}",
-                            path.display()
-                        );
+                }
+            }
+            notify::EventKind::Modify(ModifyKind::Name(rename_mode)) => {
+                if let Err(err) = vault.handle_rename_event(rename_mode, event.paths) {
+                    if dispatch_enforcement_error(&vault, err) {
                         std::process::exit(1);
                     }
                 }
             }
             notify::EventKind::Modify(_) => {
                 for path in event.paths {
-                    if let Err(err) = vault.encrypt_plain_file_if_needed(
-                        &path,
-                        DirectoryPolicy::AllowExisting,
-                    ) {
-                        eprintln!(
-                            "vault integrity violation detected at {}: {err}",
-                            path.display()
-                        );
-                        std::process::exit(1);
+                    if let Err(err) =
+                        vault.encrypt_plain_file_if_needed(&path, DirectoryPolicy::AllowExisting)
+                    {
+                        if dispatch_enforcement_error(&vault, err) {
+                            std::process::exit(1);
+                        }
                     }
                 }
             }
             notify::EventKind::Remove(_) => {
                 for path in event.paths {
                     if let Err(err) = vault.guard_external_removal(&path) {
-                        eprintln!(
-                            "vault integrity violation detected at {}: {err}",
-                            path.display()
-                        );
-                        std::process::exit(1);
+                        if dispatch_enforcement_error(&vault, err) {
+                            std::process::exit(1);
+                        }
                     }
                 }
             }
@@ -278,10 +302,10 @@ impl Vault {
 
         let mut known_dirs = HashSet::new();
         known_dirs.insert(path.clone());
-        
+
         // Scan and track existing directories
         Self::scan_and_track_directories(&path, &mut known_dirs)?;
-        
+
         let vault = Vault {
             path: path.clone(),
             keypair,
@@ -290,7 +314,7 @@ impl Vault {
             sanctioned_directories: Arc::new(Mutex::new(HashSet::new())),
             known_directories: Arc::new(Mutex::new(known_dirs)),
         };
-        
+
         // Sanction all existing directories (they were there before vault init)
         if let Ok(mut dir_ledger) = vault.sanctioned_directories.lock() {
             if let Ok(known_dirs) = vault.known_directories.lock() {
@@ -301,11 +325,14 @@ impl Vault {
                 }
             }
         }
-        
+
         Ok(vault)
     }
 
-    fn scan_and_track_directories(root: &PathBuf, known_dirs: &mut HashSet<PathBuf>) -> Result<(), DynError> {
+    fn scan_and_track_directories(
+        root: &PathBuf,
+        known_dirs: &mut HashSet<PathBuf>,
+    ) -> Result<(), DynError> {
         let entries = fs::read_dir(root)?;
         for entry in entries {
             let entry = entry?;
@@ -327,16 +354,6 @@ impl Vault {
         }
     }
 
-    fn authorize_directory_creation(&self, path: &PathBuf) {
-        if let Ok(mut ledger) = self.sanctioned_directories.lock() {
-            ledger.insert(path.clone());
-        }
-        // Also track it as a known directory
-        if let Ok(mut known_dirs) = self.known_directories.lock() {
-            known_dirs.insert(path.clone());
-        }
-    }
-
     fn is_directory_sanctioned(&self, path: &PathBuf) -> bool {
         if path == &self.path {
             return true;
@@ -350,7 +367,11 @@ impl Vault {
 
     fn guard_external_removal(&self, path: &PathBuf) -> Result<(), DynError> {
         if path == &self.path {
-            return Err("vault root cannot be removed while Theo Vault is active".into());
+            return Err(VaultViolation::directory_deletion(
+                path,
+                "vault root cannot be removed while Theo Vault is active",
+            )
+            .into());
         }
 
         // Check if it's a known directory (since we can't check metadata after removal)
@@ -372,9 +393,9 @@ impl Vault {
                 }
                 return Ok(());
             }
-            return Err(format!(
-                "vault integrity violation: directory deletion detected at {}",
-                path.display()
+            return Err(VaultViolation::directory_deletion(
+                path,
+                "vault integrity violation: directory deletion detected",
             )
             .into());
         }
@@ -385,11 +406,124 @@ impl Vault {
             return Ok(());
         }
 
-        Err(format!(
-            "vault integrity violation: deletion detected at {}",
-            path.display()
+        Err(
+            VaultViolation::file_deletion(path, "vault integrity violation: deletion detected")
+                .into(),
         )
-        .into())
+    }
+
+    fn process_new_entry(&self, path: &PathBuf) -> Result<(), DynError> {
+        if let Ok(metadata) = fs::metadata(path) {
+            if metadata.is_dir() {
+                if let Ok(mut known_dirs) = self.known_directories.lock() {
+                    known_dirs.insert(path.clone());
+                }
+
+                if !self.is_directory_sanctioned(path) {
+                    return Err(VaultViolation::directory_creation(
+                        path,
+                        "directories cannot be added to immutable vaults",
+                    )
+                    .into());
+                }
+                return Ok(());
+            }
+        }
+
+        self.encrypt_plain_file_if_needed(path, DirectoryPolicy::ForbidNewEntries)
+    }
+
+    fn respond_to_violation(&self, violation: VaultViolation) {
+        let VaultViolation { kind, path, detail } = violation;
+        eprintln!(
+            "vault integrity violation detected at {}: {}",
+            path.display(),
+            detail
+        );
+
+        match kind {
+            ViolationKind::DirectoryCreation => {
+                if path == self.path {
+                    return;
+                }
+
+                self.authorize_internal_removal(&path);
+                if let Err(err) = fs::remove_dir_all(&path) {
+                    eprintln!(
+                        "failed to remove unauthorized directory {}: {err}",
+                        path.display()
+                    );
+                }
+
+                if let Ok(mut known_dirs) = self.known_directories.lock() {
+                    known_dirs.remove(&path);
+                }
+                if let Ok(mut dir_ledger) = self.sanctioned_directories.lock() {
+                    dir_ledger.remove(&path);
+                }
+            }
+            ViolationKind::DirectoryDeletion => {
+                if path == self.path && !path.exists() {
+                    if let Err(err) = fs::create_dir_all(&path) {
+                        eprintln!("failed to recreate vault root after deletion attempt: {err}");
+                    }
+                }
+                if let Ok(mut known_dirs) = self.known_directories.lock() {
+                    known_dirs.remove(&path);
+                }
+            }
+            ViolationKind::FileDeletion | ViolationKind::UnauthorizedEntry => {}
+        }
+    }
+
+    fn handle_rename_event(&self, mode: RenameMode, paths: Vec<PathBuf>) -> Result<(), DynError> {
+        match mode {
+            RenameMode::From => {
+                if paths.is_empty() {
+                    return Err("rename event missing source path".into());
+                }
+                for path in paths {
+                    self.guard_external_removal(&path)?;
+                }
+                Ok(())
+            }
+            RenameMode::To => {
+                if paths.is_empty() {
+                    return Err("rename event missing destination path".into());
+                }
+                for path in paths {
+                    self.process_new_entry(&path)?;
+                }
+                Ok(())
+            }
+            RenameMode::Both => {
+                if paths.len() < 2 {
+                    return Err("rename event missing either source or destination path".into());
+                }
+                let mut iter = paths.into_iter();
+                if let Some(source) = iter.next() {
+                    self.guard_external_removal(&source)?;
+                }
+                for destination in iter {
+                    self.process_new_entry(&destination)?;
+                }
+                Ok(())
+            }
+            RenameMode::Any => {
+                if paths.is_empty() {
+                    return Err("rename event missing paths".into());
+                }
+                for path in paths {
+                    if path.exists() {
+                        self.process_new_entry(&path)?;
+                    } else {
+                        self.guard_external_removal(&path)?;
+                    }
+                }
+                Ok(())
+            }
+            _ => Err("unsupported rename mode detected".into()),
+        }
     }
 
     fn encrypt_file(&self, path: &PathBuf) -> Result<(), DynError> {
@@ -507,20 +641,22 @@ impl Vault {
 
             return match directory_policy {
                 DirectoryPolicy::AllowExisting => Ok(()),
-                DirectoryPolicy::ForbidNewEntries => Err(format!(
-                    "directories cannot be added to immutable vaults ({}).",
-                    path.display()
+                DirectoryPolicy::ForbidNewEntries => Err(VaultViolation::directory_creation(
+                    path,
+                    "directories cannot be added to immutable vaults",
                 )
                 .into()),
             };
         }
 
         if !metadata.is_file() {
-            return Err(format!(
-                "unauthorized non-file entry detected ({}). Vaults are immutable; no folders or special files allowed.",
-                path.display()
-            )
-            .into());
+            return Err(
+                VaultViolation::unauthorized_entry(
+                    path,
+                    "unauthorized non-file entry detected. Vaults are immutable; no folders or special files allowed.",
+                )
+                .into(),
+            );
         }
 
         if path.extension().map_or(false, |e| e == "pqc") {
@@ -584,26 +720,28 @@ impl Vault {
             sealed_len,
             sealed_hash
         );
-        println!(
-            "ML-KEM  ▸ pk {}",
-            self.keypair.mlkem_public_hex()
-        );
+        println!("ML-KEM  ▸ pk {}", self.keypair.mlkem_public_hex());
         println!(
             "          ct {} | shared {}",
-            kem_ciphertext_hash,
-            shared_secret_hash
+            kem_ciphertext_hash, shared_secret_hash
         );
-        println!(
-            "Dilithium ▸ pk {}",
-            self.keypair.dilithium_public_hex()
-        );
+        println!("Dilithium ▸ pk {}", self.keypair.dilithium_public_hex());
         println!("            signature {}", signature_hash);
-        println!(
-            "TupleChain ▸ entry #{} committed @ {}",
-            tuple_id,
-            timestamp
-        );
+        println!("TupleChain ▸ entry #{} committed @ {}", tuple_id, timestamp);
         println!("Proof complete — ready to paste into your vaulted document.\n");
+    }
+}
+
+fn dispatch_enforcement_error(vault: &Vault, err: DynError) -> bool {
+    match err.downcast::<VaultViolation>() {
+        Ok(violation) => {
+            vault.respond_to_violation(*violation);
+            false
+        }
+        Err(err) => {
+            eprintln!("fatal Theo Vault error: {err}");
+            true
+        }
     }
 }
 
@@ -726,6 +864,7 @@ fn is_file_in_use_error(err: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use notify::event::RenameMode;
     use std::fs;
     use tempfile::tempdir;
 
@@ -840,6 +979,76 @@ mod tests {
         assert!(
             err.to_string().contains("deletion detected"),
             "error should mention deletion detection"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn renaming_files_outside_vault_is_detected() -> Result<(), DynError> {
+        let temp = tempdir().expect("temp dir");
+        let vault_dir = temp.path().join("vault");
+        let vault = Vault::init(vault_dir.clone())?;
+
+        let target = vault_dir.join("document.txt");
+        fs::write(&target, b"classified intel")?;
+
+        let err = vault
+            .handle_rename_event(RenameMode::From, vec![target.clone()])
+            .expect_err("renaming files out of the vault should be blocked");
+        assert!(
+            err.to_string().contains("deletion detected"),
+            "error should mention deletion detection"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn moving_plain_files_into_vault_triggers_encryption() -> Result<(), DynError> {
+        let temp = tempdir().expect("temp dir");
+        let vault_dir = temp.path().join("vault");
+        let vault = Vault::init(vault_dir.clone())?;
+
+        let staging = temp.path().join("outside.txt");
+        fs::write(&staging, b"hello from outside")?;
+
+        let inside_path = vault_dir.join("outside.txt");
+        fs::rename(&staging, &inside_path)?;
+
+        vault.handle_rename_event(RenameMode::To, vec![inside_path.clone()])?;
+
+        let sealed = inside_path.with_extension("pqc");
+        assert!(
+            sealed.exists(),
+            "moved plaintext files should be immediately sealed"
+        );
+        assert!(
+            !inside_path.exists(),
+            "plaintext should be purged after sealing"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn moving_directories_into_vault_is_blocked() -> Result<(), DynError> {
+        let temp = tempdir().expect("temp dir");
+        let vault_dir = temp.path().join("vault");
+        let vault = Vault::init(vault_dir.clone())?;
+
+        let staging_dir = temp.path().join("incoming");
+        fs::create_dir(&staging_dir)?;
+
+        let inside_dir = vault_dir.join("incoming");
+        fs::rename(&staging_dir, &inside_dir)?;
+
+        let err = vault
+            .handle_rename_event(RenameMode::To, vec![inside_dir.clone()])
+            .expect_err("directories moved into the vault should be rejected");
+        assert!(
+            err.to_string().contains("directories cannot be added"),
+            "error should describe directory ban"
         );
 
         Ok(())
