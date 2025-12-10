@@ -8,4 +8,4 @@ cargo build --release --features windows-overlay
 # 3. Initialize your vault
 ./target/release/theo-vault.exe init "C:\Users\Kenneth\THEO"
 
-# 4. Drop any file → instantly becomes a sealed PQC bundle with green lock
+# 4. Drop any file → instantly becomes .pqc with green lock
