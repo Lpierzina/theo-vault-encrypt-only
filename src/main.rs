@@ -6,14 +6,12 @@ use std::collections::HashSet;
 use std::env;
 use std::fmt::{self, Write as FmtWrite};
 use std::fs;
-use std::io::{self, Read};
+use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
-
-const SEALED_MAGIC: [u8; 11] = *b"THEO_PQC_v1";
 
 #[derive(Clone, Copy)]
 enum DirectoryPolicy {
@@ -532,10 +530,6 @@ impl Vault {
         const LOCK_RETRY_MAX_ATTEMPTS: u8 = 10;
         const LOCK_RETRY_BACKOFF_MS: u64 = 150;
 
-        if Self::is_sealed_artifact(path)? {
-            return Ok(());
-        }
-
         let data = {
             let mut attempt: u8 = 0;
             loop {
@@ -576,13 +570,11 @@ impl Vault {
             signature,
             path.file_name().unwrap().to_string_lossy(),
         ))?;
-        let mut sealed_bundle = Vec::with_capacity(SEALED_MAGIC.len() + bundle.len());
-        sealed_bundle.extend_from_slice(&SEALED_MAGIC);
-        sealed_bundle.extend_from_slice(&bundle);
-        let sealed_len = sealed_bundle.len();
-        let sealed_hash = blake3_hex(&sealed_bundle);
+        let sealed_len = bundle.len();
+        let sealed_hash = blake3_hex(&bundle);
 
-        match fs::write(path, &sealed_bundle) {
+        let encrypted_path = path.with_extension("pqc");
+        match fs::write(&encrypted_path, &bundle) {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 // Folder disappeared before we could persist the bundle.
@@ -591,26 +583,28 @@ impl Vault {
             Err(err) => return Err(err.into()),
         }
 
+        self.purge_plaintext(path)?;
+
         println!(
-            "[theo-vault] sealed {} ({} bytes plaintext → {} bytes sealed)",
+            "[theo-vault] sealed {} → {} ({} bytes)",
             path.display(),
-            plaintext_len,
-            sealed_len
+            encrypted_path.display(),
+            plaintext_len
         );
 
         #[cfg(all(windows, feature = "windows-overlay"))]
-        apply_encrypted_overlay(path)?;
+        apply_encrypted_overlay(&encrypted_path)?;
 
         let proof_timestamp = chrono::Utc::now();
         // Mint TupleChain entry
         let tuple_sequence = {
             let mut chain = self.tuplechain.lock().unwrap();
-            chain.mint_encrypted_file(path, path, proof_timestamp)
+            chain.mint_encrypted_file(path, &encrypted_path, proof_timestamp)
         };
 
         self.emit_file_proof(
             path,
-            path,
+            &encrypted_path,
             plaintext_len,
             &plaintext_hash,
             sealed_len,
@@ -625,21 +619,6 @@ impl Vault {
         // Zeroize plaintext from RAM
         drop(data);
         Ok(())
-    }
-
-    fn is_sealed_artifact(path: &PathBuf) -> Result<bool, DynError> {
-        let mut file = match fs::File::open(path) {
-            Ok(file) => file,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(err) => return Err(err.into()),
-        };
-
-        let mut header = [0u8; SEALED_MAGIC.len()];
-        match file.read_exact(&mut header) {
-            Ok(()) => Ok(header == SEALED_MAGIC),
-            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
-            Err(err) => Err(err.into()),
-        }
     }
 
     fn encrypt_plain_file_if_needed(
@@ -700,6 +679,17 @@ impl Vault {
         }
     }
 
+    fn purge_plaintext(&self, path: &PathBuf) -> Result<(), DynError> {
+        match fs::remove_file(path) {
+            Ok(()) => {
+                self.authorize_internal_removal(path);
+                Ok(())
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err.into()),
+        }
+    }
+
     fn emit_file_proof(
         &self,
         original: &PathBuf,
@@ -725,7 +715,7 @@ impl Vault {
             plaintext_hash
         );
         println!(
-            "After  ▸ {} (sealed artifact, {} bytes, blake3 {})",
+            "After  ▸ {} ({} bytes, blake3 {})",
             encrypted.display(),
             sealed_len,
             sealed_hash
@@ -841,7 +831,7 @@ fn apply_overlay_to_folder(path: &PathBuf) -> Result<(), DynError> {
 #[cfg(all(windows, feature = "windows-overlay"))]
 fn apply_encrypted_overlay(_path: &PathBuf) -> Result<(), DynError> {
     // Real Windows IOverlayIcon implementation
-    // Shows green padlock on sealed Theo Vault files and folders
+    // Shows green padlock on .pqc files and folders
     Ok(())
 }
 
@@ -911,19 +901,17 @@ mod tests {
 
         vault.encrypt_file(&plaintext)?;
 
+        let encrypted = plaintext.with_extension("pqc");
+        assert!(encrypted.exists(), "encrypted bundle should exist");
         assert!(
-            plaintext.exists(),
-            "sealed artifacts should remain at their original path"
-        );
-        assert!(
-            Vault::is_sealed_artifact(&plaintext)?,
-            "sealed artifacts must carry the Theo Vault header"
+            !plaintext.exists(),
+            "plaintext should be removed after encryption"
         );
 
         let chain = vault.tuplechain.lock().unwrap();
         let last = chain.entries.last().expect("tuplechain entry recorded");
         assert_eq!(last.original, plaintext);
-        assert_eq!(last.encrypted, plaintext);
+        assert_eq!(last.encrypted, encrypted);
 
         Ok(())
     }
@@ -971,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    fn sealed_artifacts_reject_unsanctioned_removals() -> Result<(), DynError> {
+    fn internal_plaintext_purges_are_tracked() -> Result<(), DynError> {
         let temp = tempdir().expect("temp dir");
         let vault_dir = temp.path().join("vault");
         let vault = Vault::init(vault_dir.clone())?;
@@ -980,18 +968,14 @@ mod tests {
         fs::write(&plaintext, b"hello sovereign world")?;
         vault.encrypt_file(&plaintext)?;
 
-        let err = vault
+        vault
             .guard_external_removal(&plaintext)
-            .expect_err("sealed artifacts should not be removable without sanction");
-        assert!(
-            err.to_string().contains("deletion detected"),
-            "error should mention deletion detection"
-        );
+            .expect("self-initiated removals should be whitelisted");
 
         let rogue = vault_dir.join("rogue.txt");
         let err = vault
             .guard_external_removal(&rogue)
-            .expect_err("unauthorized deletion should still be blocked");
+            .expect_err("unauthorized deletion should be blocked");
         assert!(
             err.to_string().contains("deletion detected"),
             "error should mention deletion detection"
@@ -1034,13 +1018,14 @@ mod tests {
 
         vault.handle_rename_event(RenameMode::To, vec![inside_path.clone()])?;
 
+        let sealed = inside_path.with_extension("pqc");
         assert!(
-            inside_path.exists(),
-            "sealed artifact should persist at the original path"
+            sealed.exists(),
+            "moved plaintext files should be immediately sealed"
         );
         assert!(
-            Vault::is_sealed_artifact(&inside_path)?,
-            "sealed artifacts must include the Theo Vault header"
+            !inside_path.exists(),
+            "plaintext should be purged after sealing"
         );
 
         Ok(())
