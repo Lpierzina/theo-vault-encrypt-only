@@ -17,6 +17,24 @@ It is the end of the era of data breaches, ransomware, and surveillance capitali
 Welcome to the sovereign internet.
 Your vault is ready.
 
+## Theo Vault Flow at a Glance
+Theo Vault is a zero-trust pipeline: files never sit unprotected, and every transition produces audit-grade evidence tied to PQC primitives.
+
+```
+┌───────────────┐   drag & drop    ┌────────────────────┐   emits jobs   ┌────────────────────┐
+│ Source files  │ ───────────────▶ │ Vault watcher (FS) │ ──────────────▶│ PQC intake engine  │
+└──────┬────────┘                  └─────────┬──────────┘                 └─────────┬──────────┘
+       │ hashes + metadata                   │ orchestrates ML-KEM/Dilithium         │ writes .pqc
+       ▼                                    ▼                                      ▼
+┌───────────────┐   PQC sealing   ┌────────────────────┐   commits   ┌────────────────────────┐
+│ Autheo PQCnet │ ◀──────────────▶│ TupleChain ledger  │────────────▶│ Quantum-immune .pqc    │
+└───────────────┘                 └────────────────────┘             └────────────────────────┘
+```
+
+1. **Vault watcher** captures recursive file events the moment they hit disk (including nested folders).
+2. **PQC intake engine** derives ephemeral ML-KEM/Dilithium key material, seals the artifact, and emits BEFORE/AFTER transcripts.
+3. **TupleChain ledger** records the proof tuple locally so every `.pqc` file is forever linked to its cryptographic receipt.
+
 ## Run It Locally
 1. Compile or run directly with Cargo: `cargo run -- init /path/to/vault`.
 2. The first log line after the usage banner confirms where the Autheo PQC runtime `.wasm` payload was loaded from.
@@ -78,6 +96,39 @@ Dilithium ▸ pk 36ed6e36af98f719f56430cf6d9ad6dafad16c36c5e3497833d75b7b2ccb0c2
 TupleChain ▸ entry #18 committed @ 2025-12-10T20:11:07Z
 Proof complete — ready to paste into your vaulted document.
 ```
+
+### Detailed Proof Walkthrough (Windows vault)
+When you paste `C:/Users/aeria/Videos/AutheoPrivacyNet/vaults/theo-vault\target` into the watcher, the console prints the following and every line carries audit information:
+
+```
+════ Theo Vault PQC Intake @ 2025-12-10T00:44:45.273383900+00:00 ════
+Folder pasted into vault: C:/Users/aeria/Videos/AutheoPrivacyNet/vaults/theo-vault\target
+ML-KEM-1024 public key: f374830ebc0009b8b03c9d690e1f82d9f1f9000e0db964203ae9c65f835e5703
+Dilithium5 public key: 5778deb5b0aaf82c1fd828ebd4a1d0ffa8cf1e7fe03e0fed0a0ac77b74dc662c
+Every file inside will emit BEFORE/AFTER PQC proofs.
+══════════════════════════════════════════
+[theo-vault] sealed C:/Users/aeria/Videos/AutheoPrivacyNet/vaults/theo-vault\pqc-vault.html → C:/Users/aeria/Videos/AutheoPrivacyNet/vaults/theo-vault\pqc-vault.pqc (5783 bytes)
+──── Theo Vault PQC Proof @ 2025-12-10T00:44:48.520248200+00:00 ────
+Before ▸ C:/Users/aeria/Videos/AutheoPrivacyNet/vaults/theo-vault\pqc-vault.html (5783 bytes, blake3 da0e8d83cb025d1ab3c9e1d35a9be41fbfb211ef491456e40c25eb0a214fefad)
+After  ▸ C:/Users/aeria/Videos/AutheoPrivacyNet/vaults/theo-vault\pqc-vault.pqc (5985 bytes, blake3 c1bb57c8162366f2cff5282811425103aa1a1280edf7e1223920189210728fd7)
+ML-KEM  ▸ pk f374830ebc0009b8b03c9d690e1f82d9f1f9000e0db964203ae9c65f835e5703
+          ct f366cae5e33382091e07c43eab3a5d8849861e9638734c50981463ebe92b4699 | shared b31f1937c3ac2a78d9b8dc594ab553fc27629827ffcbb91710fc5f78641ad844
+Dilithium ▸ pk 5778deb5b0aaf82c1fd828ebd4a1d0ffa8cf1e7fe03e0fed0a0ac77b74dc662c
+            signature 8e4ab7804e30756fbdfa89d557024cf0083d614d771439170ee045ee1c377544
+TupleChain ▸ entry #1 committed @ 2025-12-10 00:44:48.520248200 UTC
+Proof complete — ready to paste into your vaulted document.
+```
+
+- **Intake banner** – announces the ingestion start time (UTC nanosecond precision) so you can correlate it with TupleChain entries and OS-level audit logs.
+- **Folder pasted** – confirms the exact Windows path Theo Vault is recursively sealing; mixed `/` + `\` separators are normalized internally before hashing.
+- **Public keys** – lists the ML-KEM-1024 encapsulation key and Dilithium5 signing key that will be reused for every file in this drop; anyone can recompute proofs if they possess these pubkeys.
+- **Sealed line** – `[theo-vault] sealed ... → ... (bytes)` proves which plaintext became which `.pqc` artifact and records the plaintext size that fed the pipeline.
+- **Per-file proof banner** – `──── Theo Vault PQC Proof ... ────` marks the file-level audit scope; timestamps typically trail the intake banner by milliseconds because sealing happens immediately.
+- **Before/After rows** – show byte counts plus BLAKE3 fingerprints for both the raw file and the PQC output; if the hashes ever differ from what you expect, integrity has been compromised.
+- **ML-KEM block** – includes the public key, the ciphertext (ct), and the shared-secret digest; together they prove the encapsulation step used PQC-safe parameters and ephemeral randomness.
+- **Dilithium block** – the Dilithium5 public key signs the entire proof tuple; the signature lets third parties verify the transformation without touching the plaintext.
+- **TupleChain entry** – states the local ledger index and timestamp that immortalize the proof in your sovereign audit log; downstream systems can fetch `entry #1` and compare hashes.
+- **Proof complete** – indicates the transcript is copy/paste ready for vault manifests, tickets, or regulated exports.
 
 # About THEO Vault
 ✅ Real-time file encryption (CKKS)
