@@ -1,6 +1,7 @@
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use pqcnet::kem::MlKem1024;
 use pqcnet::sig::Dilithium5;
+use std::collections::HashSet;
 use std::env;
 use std::fmt::{self, Write as FmtWrite};
 use std::fs;
@@ -10,6 +11,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
+
+#[derive(Clone, Copy)]
+enum DirectoryPolicy {
+    AllowExisting,
+    ForbidNewEntries,
+}
 
 fn hex_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -28,6 +35,7 @@ struct Vault {
     path: PathBuf,
     keypair: KeyPair,
     tuplechain: Arc<Mutex<TupleChain>>,
+    sanctioned_removals: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 #[derive(Clone)]
@@ -187,19 +195,47 @@ fn main() -> Result<(), DynError> {
             }
         };
 
-        if matches!(
-            event.kind,
-            notify::EventKind::Create(_) | notify::EventKind::Modify(_)
-        ) {
-            for path in event.paths {
-                if let Err(err) = vault.encrypt_plain_file_if_needed(&path) {
-                    eprintln!(
-                        "vault integrity violation detected at {}: {err}",
-                        path.display()
-                    );
-                    std::process::exit(1);
+        match event.kind {
+            notify::EventKind::Create(_) => {
+                for path in event.paths {
+                    if let Err(err) = vault.encrypt_plain_file_if_needed(
+                        &path,
+                        DirectoryPolicy::ForbidNewEntries,
+                    ) {
+                        eprintln!(
+                            "vault integrity violation detected at {}: {err}",
+                            path.display()
+                        );
+                        std::process::exit(1);
+                    }
                 }
             }
+            notify::EventKind::Modify(_) => {
+                for path in event.paths {
+                    if let Err(err) = vault.encrypt_plain_file_if_needed(
+                        &path,
+                        DirectoryPolicy::AllowExisting,
+                    ) {
+                        eprintln!(
+                            "vault integrity violation detected at {}: {err}",
+                            path.display()
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+            notify::EventKind::Remove(_) => {
+                for path in event.paths {
+                    if let Err(err) = vault.guard_external_removal(&path) {
+                        eprintln!(
+                            "vault integrity violation detected at {}: {err}",
+                            path.display()
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -219,7 +255,31 @@ impl Vault {
             path,
             keypair,
             tuplechain,
+            sanctioned_removals: Arc::new(Mutex::new(HashSet::new())),
         })
+    }
+
+    fn authorize_internal_removal(&self, path: &PathBuf) {
+        if let Ok(mut ledger) = self.sanctioned_removals.lock() {
+            ledger.insert(path.clone());
+        }
+    }
+
+    fn guard_external_removal(&self, path: &PathBuf) -> Result<(), DynError> {
+        if path == &self.path {
+            return Err("vault root cannot be removed while Theo Vault is active".into());
+        }
+
+        let mut ledger = self.sanctioned_removals.lock().unwrap();
+        if ledger.remove(path) {
+            return Ok(());
+        }
+
+        Err(format!(
+            "vault integrity violation: deletion detected at {}",
+            path.display()
+        )
+        .into())
     }
 
     fn encrypt_file(&self, path: &PathBuf) -> Result<(), DynError> {
@@ -317,7 +377,11 @@ impl Vault {
         Ok(())
     }
 
-    fn encrypt_plain_file_if_needed(&self, path: &PathBuf) -> Result<(), DynError> {
+    fn encrypt_plain_file_if_needed(
+        &self,
+        path: &PathBuf,
+        directory_policy: DirectoryPolicy,
+    ) -> Result<(), DynError> {
         let metadata = match fs::metadata(path) {
             Ok(metadata) => metadata,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -327,11 +391,18 @@ impl Vault {
         };
 
         if metadata.is_dir() {
-            // Directories are allowed; files within them will be processed individually.
-            if path != &self.path {
-                self.emit_folder_ingest_proof(path);
+            if path == &self.path {
+                return Ok(());
             }
-            return Ok(());
+
+            return match directory_policy {
+                DirectoryPolicy::AllowExisting => Ok(()),
+                DirectoryPolicy::ForbidNewEntries => Err(format!(
+                    "directories cannot be added to immutable vaults ({}).",
+                    path.display()
+                )
+                .into()),
+            };
         }
 
         if !metadata.is_file() {
@@ -364,27 +435,13 @@ impl Vault {
 
     fn purge_plaintext(&self, path: &PathBuf) -> Result<(), DynError> {
         match fs::remove_file(path) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.authorize_internal_removal(path);
+                Ok(())
+            }
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(err.into()),
         }
-    }
-
-    fn emit_folder_ingest_proof(&self, folder: &PathBuf) {
-        let timestamp = chrono::Utc::now();
-        println!();
-        println!(
-            "════ Theo Vault PQC Intake @ {} ════",
-            timestamp.to_rfc3339()
-        );
-        println!("Folder pasted into vault: {}", folder.display());
-        println!("ML-KEM-1024 public key: {}", self.keypair.mlkem_public_hex());
-        println!(
-            "Dilithium5 public key: {}",
-            self.keypair.dilithium_public_hex()
-        );
-        println!("Every file inside will emit BEFORE/AFTER PQC proofs.");
-        println!("══════════════════════════════════════════");
     }
 
     fn emit_file_proof(
@@ -611,7 +668,27 @@ mod tests {
     }
 
     #[test]
-    fn directory_events_are_ignored() -> Result<(), DynError> {
+    fn directory_creation_is_blocked() -> Result<(), DynError> {
+        let temp = tempdir().expect("temp dir");
+        let vault_dir = temp.path().join("vault");
+        let vault = Vault::init(vault_dir.clone())?;
+
+        let nested_dir = vault_dir.join("nested");
+        fs::create_dir(&nested_dir)?;
+
+        let err = vault
+            .encrypt_plain_file_if_needed(&nested_dir, DirectoryPolicy::ForbidNewEntries)
+            .expect_err("new directories should be rejected");
+        assert!(
+            err.to_string().contains("directories cannot be added"),
+            "error should describe directory ban"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn existing_directories_are_ignored() -> Result<(), DynError> {
         let temp = tempdir().expect("temp dir");
         let vault_dir = temp.path().join("vault");
         let vault = Vault::init(vault_dir.clone())?;
@@ -620,13 +697,39 @@ mod tests {
         fs::create_dir(&nested_dir)?;
 
         vault
-            .encrypt_plain_file_if_needed(&nested_dir)
-            .expect("directories should be ignored");
+            .encrypt_plain_file_if_needed(&nested_dir, DirectoryPolicy::AllowExisting)
+            .expect("existing directories should be ignored");
 
         let chain = vault.tuplechain.lock().unwrap();
         assert!(
             chain.entries.is_empty(),
             "directories should not mint tuplechain entries"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn internal_plaintext_purges_are_tracked() -> Result<(), DynError> {
+        let temp = tempdir().expect("temp dir");
+        let vault_dir = temp.path().join("vault");
+        let vault = Vault::init(vault_dir.clone())?;
+
+        let plaintext = vault_dir.join("note.txt");
+        fs::write(&plaintext, b"hello sovereign world")?;
+        vault.encrypt_file(&plaintext)?;
+
+        vault
+            .guard_external_removal(&plaintext)
+            .expect("self-initiated removals should be whitelisted");
+
+        let rogue = vault_dir.join("rogue.txt");
+        let err = vault
+            .guard_external_removal(&rogue)
+            .expect_err("unauthorized deletion should be blocked");
+        assert!(
+            err.to_string().contains("deletion detected"),
+            "error should mention deletion detection"
         );
 
         Ok(())
