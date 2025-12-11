@@ -6,12 +6,34 @@ use std::collections::HashSet;
 use std::env;
 use std::fmt::{self, Write as FmtWrite};
 use std::fs;
-use std::io;
+use std::io::{self, IsTerminal};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
+
+fn color_badges_enabled() -> bool {
+    io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none()
+}
+
+fn vault_badge_active() -> &'static str {
+    if color_badges_enabled() {
+        "\u{001b}[1;92mⓋ\u{001b}[0m"
+    } else {
+        "[V]"
+    }
+}
+
+fn vault_badge_dimmed() -> &'static str {
+    if color_badges_enabled() {
+        "\u{001b}[2;37mⓋ\u{001b}[0m"
+    } else {
+        "[ ]"
+    }
+}
 
 #[derive(Clone, Copy)]
 enum DirectoryPolicy {
@@ -228,65 +250,102 @@ fn main() -> Result<(), DynError> {
     let vault_path = PathBuf::from(&args[2]);
     let vault = Vault::init(vault_path)?;
 
-    println!("Theo Vault active on: {}", vault.path.display());
+    println!(
+        "{} Theo Vault active on: {}",
+        vault_badge_active(),
+        vault.path.display()
+    );
     println!("All files are now quantum-immune. Breach = worthless.");
+    println!("Press Ctrl+C to safely un-watch this vault.");
 
     #[cfg(all(windows, feature = "windows-overlay"))]
     register_shell_overlay()?;
 
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = channel();
     let mut watcher = RecommendedWatcher::new(tx, Config::default())?;
     watcher.watch(&vault.path, RecursiveMode::Recursive)?;
+    let shutdown = Arc::new(AtomicBool::new(false));
+    {
+        let shutdown = shutdown.clone();
+        ctrlc::set_handler(move || {
+            shutdown.store(true, Ordering::SeqCst);
+        })?;
+    }
 
-    for result in rx {
-        let event = match result {
-            Ok(event) => event,
-            Err(err) => {
-                eprintln!("watch error: {err}");
-                continue;
-            }
-        };
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
 
-        match event.kind {
-            notify::EventKind::Create(_) => {
-                for path in event.paths {
-                    if let Err(err) = vault.process_new_entry(&path) {
-                        if dispatch_enforcement_error(&vault, err) {
-                            std::process::exit(1);
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(result) => {
+                let event = match result {
+                    Ok(event) => event,
+                    Err(err) => {
+                        eprintln!("watch error: {err}");
+                        continue;
+                    }
+                };
+
+                match event.kind {
+                    notify::EventKind::Create(_) => {
+                        for path in event.paths {
+                            if let Err(err) = vault.process_new_entry(&path) {
+                                if dispatch_enforcement_error(&vault, err) {
+                                    std::process::exit(1);
+                                }
+                            }
                         }
                     }
-                }
-            }
-            notify::EventKind::Modify(ModifyKind::Name(rename_mode)) => {
-                if let Err(err) = vault.handle_rename_event(rename_mode, event.paths) {
-                    if dispatch_enforcement_error(&vault, err) {
-                        std::process::exit(1);
-                    }
-                }
-            }
-            notify::EventKind::Modify(_) => {
-                for path in event.paths {
-                    if let Err(err) =
-                        vault.encrypt_plain_file_if_needed(&path, DirectoryPolicy::AllowExisting)
-                    {
-                        if dispatch_enforcement_error(&vault, err) {
-                            std::process::exit(1);
+                    notify::EventKind::Modify(ModifyKind::Name(rename_mode)) => {
+                        if let Err(err) = vault.handle_rename_event(rename_mode, event.paths) {
+                            if dispatch_enforcement_error(&vault, err) {
+                                std::process::exit(1);
+                            }
                         }
                     }
-                }
-            }
-            notify::EventKind::Remove(_) => {
-                for path in event.paths {
-                    if let Err(err) = vault.guard_external_removal(&path) {
-                        if dispatch_enforcement_error(&vault, err) {
-                            std::process::exit(1);
+                    notify::EventKind::Modify(_) => {
+                        for path in event.paths {
+                            if let Err(err) = vault
+                                .encrypt_plain_file_if_needed(&path, DirectoryPolicy::AllowExisting)
+                            {
+                                if dispatch_enforcement_error(&vault, err) {
+                                    std::process::exit(1);
+                                }
+                            }
                         }
                     }
+                    notify::EventKind::Remove(_) => {
+                        for path in event.paths {
+                            if let Err(err) = vault.guard_external_removal(&path) {
+                                if dispatch_enforcement_error(&vault, err) {
+                                    std::process::exit(1);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
-            _ => {}
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
         }
     }
+
+    if let Err(err) = watcher.unwatch(&vault.path) {
+        eprintln!(
+            "failed to un-watch vault path {}: {err}",
+            vault.path.display()
+        );
+    } else {
+        println!(
+            "{} Theo Vault disengaged on {}",
+            vault_badge_dimmed(),
+            vault.path.display()
+        );
+    }
+
+    println!("Theo Vault watcher shut down cleanly.");
     Ok(())
 }
 
@@ -586,7 +645,8 @@ impl Vault {
         self.purge_plaintext(path)?;
 
         println!(
-            "[theo-vault] sealed {} → {} ({} bytes)",
+            "[theo-vault] {} sealed {} → {} ({} bytes)",
+            vault_badge_active(),
             path.display(),
             encrypted_path.display(),
             plaintext_len
@@ -715,7 +775,8 @@ impl Vault {
             plaintext_hash
         );
         println!(
-            "After  ▸ {} ({} bytes, blake3 {})",
+            "After  ▸ {} {} ({} bytes, blake3 {})",
+            vault_badge_active(),
             encrypted.display(),
             sealed_len,
             sealed_hash
