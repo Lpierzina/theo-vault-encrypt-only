@@ -1061,7 +1061,7 @@ fn windows_notify_shell_item_change(path: &Path) {
     let wide = windows_path_to_wstring(path);
     unsafe {
         SHChangeNotify(
-            SHCNE_UPDATEITEM,
+            SHCNE_UPDATEITEM as i32,
             SHCNF_PATHW,
             wide.as_ptr() as *const _,
             ptr::null(),
@@ -1075,7 +1075,12 @@ fn windows_notify_shell_assoc_change() {
     use windows_sys::Win32::UI::Shell::{SHChangeNotify, SHCNE_ASSOCCHANGED, SHCNF_IDLIST};
 
     unsafe {
-        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, ptr::null(), ptr::null());
+        SHChangeNotify(
+            SHCNE_ASSOCCHANGED as i32,
+            SHCNF_IDLIST,
+            ptr::null(),
+            ptr::null(),
+        );
     }
 }
 
