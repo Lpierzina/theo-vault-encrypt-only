@@ -34,17 +34,17 @@ fn color_badges_enabled() -> bool {
 
 fn vault_badge_active() -> &'static str {
     if color_badges_enabled() {
-        "\u{001b}[1;92mⓋ\u{001b}[0m"
+        "\u{001b}[1;93m🛡\u{001b}[0m"
     } else {
-        "[V]"
+        "[VAULT]"
     }
 }
 
 fn vault_badge_dimmed() -> &'static str {
     if color_badges_enabled() {
-        "\u{001b}[2;37mⓋ\u{001b}[0m"
+        "\u{001b}[2;37m🛡\u{001b}[0m"
     } else {
-        "[ ]"
+        "[    ]"
     }
 }
 
