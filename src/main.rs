@@ -7,11 +7,24 @@ use std::env;
 use std::fmt::{self, Write as FmtWrite};
 use std::fs;
 use std::io::{self, IsTerminal};
-use std::path::PathBuf;
+#[cfg_attr(
+    not(any(all(windows, feature = "windows-overlay"), target_os = "macos")),
+    allow(unused_imports)
+)]
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+#[cfg(target_os = "macos")]
+use std::process::Command;
+
+#[cfg(all(windows, feature = "windows-overlay"))]
+use std::os::windows::ffi::OsStrExt;
+
+#[cfg(any(all(windows, feature = "windows-overlay"), target_os = "macos"))]
+const VAULT_BADGE_PNG: &[u8] = include_bytes!("../assets/vault_badge.png");
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -258,7 +271,7 @@ fn main() -> Result<(), DynError> {
     println!("All files are now quantum-immune. Breach = worthless.");
     println!("Press Ctrl+C to safely un-watch this vault.");
 
-    #[cfg(all(windows, feature = "windows-overlay"))]
+    #[cfg(any(all(windows, feature = "windows-overlay"), target_os = "macos"))]
     register_shell_overlay()?;
 
     let (tx, rx) = channel();
@@ -345,6 +358,14 @@ fn main() -> Result<(), DynError> {
         );
     }
 
+    #[cfg(any(all(windows, feature = "windows-overlay"), target_os = "macos"))]
+    if let Err(err) = remove_overlay_from_folder(&vault.path) {
+        eprintln!(
+            "failed to clear shell overlay for {}: {err}",
+            vault.path.display()
+        );
+    }
+
     println!("Theo Vault watcher shut down cleanly.");
     Ok(())
 }
@@ -357,6 +378,8 @@ impl Vault {
         let tuplechain = Arc::new(Mutex::new(TupleChain::new()));
 
         #[cfg(all(windows, feature = "windows-overlay"))]
+        apply_overlay_to_folder(&path)?;
+        #[cfg(target_os = "macos")]
         apply_overlay_to_folder(&path)?;
 
         let mut known_dirs = HashSet::new();
@@ -652,7 +675,7 @@ impl Vault {
             plaintext_len
         );
 
-        #[cfg(all(windows, feature = "windows-overlay"))]
+        #[cfg(any(all(windows, feature = "windows-overlay"), target_os = "macos"))]
         apply_encrypted_overlay(&encrypted_path)?;
 
         let proof_timestamp = chrono::Utc::now();
@@ -872,46 +895,286 @@ fn register_shell_overlay() -> Result<(), DynError> {
     use winreg::enums::*;
     use winreg::RegKey;
 
+    let icon_path = ensure_windows_badge_icon()?;
+    ensure_windows_file_icon_registration(&icon_path)?;
+    windows_notify_shell_assoc_change();
+
+    let exe_path = env::current_exe().unwrap_or_else(|_| PathBuf::from("theo-vault.exe"));
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let (vault_key, _) =
         hkcu.create_subkey_with_flags("Software\\Classes\\*\\shell\\pqc-vault", KEY_WRITE)?;
 
     vault_key.set_value("", &"Open with Theo Vault")?;
-    vault_key.set_value("Icon", &r"C:\Program Files\Theo\icon.ico")?;
+    vault_key.set_value("Icon", &icon_path.to_string_lossy().to_string())?;
 
     let (command_key, _) = vault_key.create_subkey_with_flags("command", KEY_WRITE)?;
-    command_key.set_value("", &r#""C:\Program Files\Theo\theo-vault.exe" "%1""#)?;
+    command_key.set_value("", &format!(r#""{}" "%1""#, exe_path.display()))?;
     Ok(())
 }
 
 #[cfg(all(windows, feature = "windows-overlay"))]
 fn apply_overlay_to_folder(path: &PathBuf) -> Result<(), DynError> {
-    apply_encrypted_overlay(path)
+    let icon_path = ensure_windows_badge_icon()?;
+    write_windows_desktop_ini(path, &icon_path)?;
+    windows_notify_shell_item_change(path);
+    Ok(())
 }
 
 #[cfg(all(windows, feature = "windows-overlay"))]
-fn apply_encrypted_overlay(_path: &PathBuf) -> Result<(), DynError> {
-    // Real Windows IOverlayIcon implementation
-    // Shows green padlock on .pqc files and folders
+fn apply_encrypted_overlay(path: &PathBuf) -> Result<(), DynError> {
+    let icon_path = ensure_windows_badge_icon()?;
+    ensure_windows_file_icon_registration(&icon_path)?;
+    windows_notify_shell_assoc_change();
+    windows_notify_shell_item_change(path);
     Ok(())
 }
 
-#[cfg(not(all(windows, feature = "windows-overlay")))]
-#[allow(dead_code)]
+#[cfg(all(windows, feature = "windows-overlay"))]
+fn remove_overlay_from_folder(path: &PathBuf) -> Result<(), DynError> {
+    let desktop_path = path.join("desktop.ini");
+    if desktop_path.exists() {
+        let _ = fs::remove_file(&desktop_path);
+    }
+    windows_clear_folder_attributes(path)?;
+    windows_notify_shell_item_change(path);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 fn register_shell_overlay() -> Result<(), DynError> {
+    ensure_macos_badge_icon().map(|_| ())
+}
+
+#[cfg(target_os = "macos")]
+fn apply_overlay_to_folder(path: &PathBuf) -> Result<(), DynError> {
+    let icon = ensure_macos_badge_icon()?;
+    set_finder_icon(path, &icon)
+}
+
+#[cfg(target_os = "macos")]
+fn apply_encrypted_overlay(path: &PathBuf) -> Result<(), DynError> {
+    let icon = ensure_macos_badge_icon()?;
+    set_finder_icon(path, &icon)
+}
+
+#[cfg(target_os = "macos")]
+fn remove_overlay_from_folder(path: &PathBuf) -> Result<(), DynError> {
+    clear_finder_icon(path)
+}
+
+#[cfg(all(windows, feature = "windows-overlay"))]
+fn ensure_windows_badge_icon() -> Result<PathBuf, DynError> {
+    use std::fs;
+
+    let base = dirs::data_local_dir()
+        .or_else(|| dirs::data_dir())
+        .unwrap_or(env::current_dir()?);
+    let icon_dir = base.join("TheoVault").join("icons");
+    fs::create_dir_all(&icon_dir)?;
+    let icon_path = icon_dir.join("vaulted.ico");
+    if !icon_path.exists() {
+        fs::write(&icon_path, build_windows_ico_from_png(VAULT_BADGE_PNG)?)?;
+    }
+    Ok(icon_path)
+}
+
+#[cfg(all(windows, feature = "windows-overlay"))]
+fn ensure_windows_file_icon_registration(icon_path: &Path) -> Result<(), DynError> {
+    use winreg::enums::*;
+    use winreg::RegKey;
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let (classes, _) = hkcu.create_subkey_with_flags("Software\\Classes", KEY_WRITE)?;
+
+    let (ext_key, _) = classes.create_subkey_with_flags(".pqc", KEY_WRITE)?;
+    ext_key.set_value("", &"TheoVault.PQC")?;
+
+    let (progid_key, _) = classes.create_subkey_with_flags("TheoVault.PQC", KEY_WRITE)?;
+    progid_key.set_value("", &"Theo Vault PQC bundle")?;
+    let (icon_key, _) = progid_key.create_subkey_with_flags("DefaultIcon", KEY_WRITE)?;
+    icon_key.set_value("", &format!("{},0", icon_path.display()))?;
+
     Ok(())
 }
 
-#[cfg(not(all(windows, feature = "windows-overlay")))]
-#[allow(dead_code)]
-fn apply_overlay_to_folder(_path: &PathBuf) -> Result<(), DynError> {
+#[cfg(all(windows, feature = "windows-overlay"))]
+fn write_windows_desktop_ini(folder: &Path, icon_path: &Path) -> Result<(), DynError> {
+    use std::fs;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_SYSTEM,
+    };
+
+    let desktop_ini = folder.join("desktop.ini");
+    let template = format!(
+        "[.ShellClassInfo]\nIconResource={0},0\nIconFile={0}\nIconIndex=0\n",
+        icon_path.display()
+    );
+    fs::write(&desktop_ini, template)?;
+    windows_set_attributes(
+        &desktop_ini,
+        FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM,
+        0,
+    )?;
+    windows_set_attributes(folder, FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM, 0)?;
     Ok(())
 }
 
-#[cfg(not(all(windows, feature = "windows-overlay")))]
-#[allow(dead_code)]
-fn apply_encrypted_overlay(_path: &PathBuf) -> Result<(), DynError> {
+#[cfg(all(windows, feature = "windows-overlay"))]
+fn windows_clear_folder_attributes(path: &Path) -> Result<(), DynError> {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_SYSTEM};
+
+    windows_set_attributes(path, 0, FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM)?;
     Ok(())
+}
+
+#[cfg(all(windows, feature = "windows-overlay"))]
+fn windows_set_attributes(path: &Path, add: u32, remove: u32) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileAttributesW, SetFileAttributesW, INVALID_FILE_ATTRIBUTES,
+    };
+
+    let wide = windows_path_to_wstring(path);
+    unsafe {
+        let attrs = GetFileAttributesW(wide.as_ptr());
+        if attrs == INVALID_FILE_ATTRIBUTES {
+            return Err(io::Error::last_os_error());
+        }
+        let mut new_attrs = attrs & !remove;
+        new_attrs |= add;
+        if SetFileAttributesW(wide.as_ptr(), new_attrs) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(windows, feature = "windows-overlay"))]
+fn windows_path_to_wstring(path: &Path) -> Vec<u16> {
+    path.as_os_str().encode_wide().chain(Some(0)).collect()
+}
+
+#[cfg(all(windows, feature = "windows-overlay"))]
+fn windows_notify_shell_item_change(path: &Path) {
+    use std::ptr;
+    use windows_sys::Win32::UI::Shell::{SHChangeNotify, SHCNE_UPDATEITEM, SHCNF_PATHW};
+
+    let wide = windows_path_to_wstring(path);
+    unsafe {
+        SHChangeNotify(
+            SHCNE_UPDATEITEM,
+            SHCNF_PATHW,
+            wide.as_ptr() as *const _,
+            ptr::null(),
+        );
+    }
+}
+
+#[cfg(all(windows, feature = "windows-overlay"))]
+fn windows_notify_shell_assoc_change() {
+    use std::ptr;
+    use windows_sys::Win32::UI::Shell::{SHChangeNotify, SHCNE_ASSOCCHANGED, SHCNF_IDLIST};
+
+    unsafe {
+        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, ptr::null(), ptr::null());
+    }
+}
+
+#[cfg(all(windows, feature = "windows-overlay"))]
+fn build_windows_ico_from_png(png: &[u8]) -> Result<Vec<u8>, DynError> {
+    let (width, height) = png_dimensions(png)?;
+    let mut out = Vec::with_capacity(22 + png.len());
+    out.extend_from_slice(&[0u8, 0, 1, 0, 1, 0]);
+    out.push(if width >= 256 { 0 } else { width as u8 });
+    out.push(if height >= 256 { 0 } else { height as u8 });
+    out.push(0);
+    out.push(0);
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&32u16.to_le_bytes());
+    out.extend_from_slice(&(png.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(22u32).to_le_bytes());
+    out.extend_from_slice(png);
+    Ok(out)
+}
+
+#[cfg(all(windows, feature = "windows-overlay"))]
+fn png_dimensions(png: &[u8]) -> Result<(u32, u32), DynError> {
+    const HEADER: &[u8] = b"\x89PNG\r\n\x1a\n";
+    if png.len() < 24 || &png[..8] != HEADER {
+        return Err("invalid PNG badge payload".into());
+    }
+    let width = u32::from_be_bytes([png[16], png[17], png[18], png[19]]);
+    let height = u32::from_be_bytes([png[20], png[21], png[22], png[23]]);
+    Ok((width, height))
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_macos_badge_icon() -> Result<PathBuf, DynError> {
+    use std::fs;
+
+    let base = dirs::data_dir().unwrap_or(env::current_dir()?);
+    let icon_dir = base.join("TheoVault").join("icons");
+    fs::create_dir_all(&icon_dir)?;
+    let icon_path = icon_dir.join("vaulted.icns");
+    if !icon_path.exists() {
+        fs::write(&icon_path, build_icns_from_png(VAULT_BADGE_PNG)?)?;
+    }
+    Ok(icon_path)
+}
+
+#[cfg(target_os = "macos")]
+fn build_icns_from_png(png: &[u8]) -> Result<Vec<u8>, DynError> {
+    let chunk_len = (png.len() + 8) as u32;
+    let total_len = chunk_len + 8;
+    let mut out = Vec::with_capacity(total_len as usize);
+    out.extend_from_slice(b"icns");
+    out.extend_from_slice(&total_len.to_be_bytes());
+    out.extend_from_slice(b"ic08");
+    out.extend_from_slice(&chunk_len.to_be_bytes());
+    out.extend_from_slice(png);
+    Ok(out)
+}
+
+#[cfg(target_os = "macos")]
+fn set_finder_icon(target: &Path, icon: &Path) -> Result<(), DynError> {
+    let script = format!(
+        r#"tell application "Finder"
+set iconFile to POSIX file "{icon}"
+set targetFile to POSIX file "{target}"
+set icon of targetFile to iconFile
+end tell"#,
+        icon = applescript_escape(icon),
+        target = applescript_escape(target)
+    );
+    run_osascript(&script)
+}
+
+#[cfg(target_os = "macos")]
+fn clear_finder_icon(target: &Path) -> Result<(), DynError> {
+    let script = format!(
+        r#"tell application "Finder"
+set targetFile to POSIX file "{target}"
+set icon of targetFile to missing value
+end tell"#,
+        target = applescript_escape(target)
+    );
+    run_osascript(&script)
+}
+
+#[cfg(target_os = "macos")]
+fn applescript_escape(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+}
+
+#[cfg(target_os = "macos")]
+fn run_osascript(script: &str) -> Result<(), DynError> {
+    let status = Command::new("osascript").arg("-e").arg(script).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("osascript exited with non-zero status".into())
+    }
 }
 
 fn is_file_in_use_error(err: &io::Error) -> bool {
