@@ -972,8 +972,13 @@ fn ensure_windows_badge_icon() -> Result<PathBuf, DynError> {
     let icon_dir = base.join("TheoVault").join("icons");
     fs::create_dir_all(&icon_dir)?;
     let icon_path = icon_dir.join("vaulted.ico");
-    if !icon_path.exists() {
-        fs::write(&icon_path, build_windows_ico_from_png(VAULT_BADGE_PNG)?)?;
+    let expected_icon = build_windows_ico_from_png(VAULT_BADGE_PNG)?;
+    let needs_refresh = match fs::read(&icon_path) {
+        Ok(existing) => existing.as_slice() != expected_icon.as_slice(),
+        Err(_) => true,
+    };
+    if needs_refresh {
+        fs::write(&icon_path, &expected_icon)?;
     }
     Ok(icon_path)
 }
@@ -1120,8 +1125,13 @@ fn ensure_macos_badge_icon() -> Result<PathBuf, DynError> {
     let icon_dir = base.join("TheoVault").join("icons");
     fs::create_dir_all(&icon_dir)?;
     let icon_path = icon_dir.join("vaulted.icns");
-    if !icon_path.exists() {
-        fs::write(&icon_path, build_icns_from_png(VAULT_BADGE_PNG)?)?;
+    let expected_icon = build_icns_from_png(VAULT_BADGE_PNG)?;
+    let needs_refresh = match fs::read(&icon_path) {
+        Ok(existing) => existing.as_slice() != expected_icon.as_slice(),
+        Err(_) => true,
+    };
+    if needs_refresh {
+        fs::write(&icon_path, &expected_icon)?;
     }
     Ok(icon_path)
 }
